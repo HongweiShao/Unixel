@@ -3,6 +3,8 @@ node_modules/
 
 # ===== 前端构建输出（最终产物，由 tauri build / vite build 重新生成） =====
 dist/
+# 临时构建产物（如 vite build --outDir dist-fixN 验证用，含旧代码不应入库）
+dist*/
 
 # ===== Rust / Tauri 后端构建产物（中间 + 最终产物） =====
 # 默认 Cargo 构建目录
