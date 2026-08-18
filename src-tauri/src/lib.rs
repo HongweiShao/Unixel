@@ -4,6 +4,12 @@ use dicom_pixeldata::PixelDecoder;
 use serde::Serialize;
 use std::path::Path;
 
+use dicom_core::Tag;
+use dicom_core::dictionary::DataDictionary;
+use dicom_core::header::Header;
+use dicom_object::InMemDicomObject;
+use image::GenericImageView;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DicomMeta {
@@ -64,6 +70,36 @@ struct BatchResult {
 struct BatchFail {
     path: String,
     error: String,
+}
+
+// 详情对话框：文件标签信息（DICOM 全量标签 / NIfTI 头 / 图像格式头）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TagRow {
+    tag: String,     // DICOM: "(gggg,eeee)"；其他: 字段名
+    vr: String,      // DICOM: VR；其他: "-"
+    keyword: String, // DICOM: 标准字典关键字；其他: 人类可读标签
+    value: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTags {
+    kind: String, // "dicom" | "nifti" | "image"
+    filename: String,
+    rows: Vec<TagRow>,
+}
+
+// 从文件夹导入：仅返回顶层影像文件的概要信息（不含像素），前端按需懒加载像素
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageInfo {
+    path: String,
+    filename: String,
+    width: u32,
+    height: u32,
+    frames: u32,
+    kind: String, // "dicom" | "image" | "htj2k"
 }
 
 #[tauri::command]
@@ -653,6 +689,313 @@ fn batch_export(
     Ok(BatchResult { ok, failed })
 }
 
+// ---------- 文件标签（详情对话框） ----------
+
+fn fname(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn image_format_label(lower: &str) -> &'static str {
+    if lower.ends_with(".png") {
+        "PNG"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "JPEG"
+    } else if lower.ends_with(".tif") || lower.ends_with(".tiff") {
+        "TIFF"
+    } else {
+        "Image"
+    }
+}
+
+// DICOM：遍历全部数据元素，返回 (tag, vr, keyword, value)
+fn dicom_tags(path: &str) -> Result<FileTags, String> {
+    let obj = dicom_object::open_file(path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+    let mut rows: Vec<TagRow> = Vec::new();
+    for elem in obj.iter() {
+        let tag = elem.tag();
+        // 跳过像素数据元素，避免载荷爆炸
+        let value = if tag == Tag(0x7FE0, 0x0010)
+            || tag == Tag(0x7FE0, 0x0008)
+            || tag == Tag(0x7FE0, 0x0009)
+        {
+            "<像素数据已省略>".to_string()
+        } else {
+            elem.to_str().unwrap_or_default().to_string()
+        };
+        let keyword = dicom_dictionary_std::StandardDataDictionary
+            .by_tag(tag)
+            .map(|e| e.alias.to_string())
+            .unwrap_or_default();
+        rows.push(TagRow {
+            tag: format!("({:04X},{:04X})", tag.group(), tag.element()),
+            vr: format!("{}", elem.vr()),
+            keyword,
+            value,
+        });
+    }
+    Ok(FileTags {
+        kind: "dicom".into(),
+        filename: fname(path),
+        rows,
+    })
+}
+
+// NIfTI：读取头字段
+fn nifti_tags(path: &str) -> Result<FileTags, String> {
+    use nifti::{NiftiObject, ReaderOptions};
+    let obj = ReaderOptions::new()
+        .read_file(path)
+        .map_err(|e| format!("读取 NIfTI 失败: {}", e))?;
+    let h = obj.header();
+    let mut rows: Vec<TagRow> = Vec::new();
+    let push = |rows: &mut Vec<TagRow>, tag: &str, keyword: &str, value: String| {
+        rows.push(TagRow {
+            tag: tag.to_string(),
+            vr: "-".into(),
+            keyword: keyword.into(),
+            value,
+        });
+    };
+    push(&mut rows, "sizeof_hdr", "HeaderSize", h.sizeof_hdr.to_string());
+    let dim: Vec<String> = h.dim.iter().map(|v| v.to_string()).collect();
+    push(&mut rows, "dim", "Dimensions", dim.join(", "));
+    push(&mut rows, "datatype", "DataType", h.datatype.to_string());
+    push(&mut rows, "bitpix", "BitPix", h.bitpix.to_string());
+    let pixdim: Vec<String> = h.pixdim.iter().map(|v| format!("{:.4}", v)).collect();
+    push(&mut rows, "pixdim", "VoxelSize", pixdim.join(", "));
+    push(&mut rows, "scl_slope", "SclSlope", h.scl_slope.to_string());
+    push(&mut rows, "scl_inter", "SclInter", h.scl_inter.to_string());
+    push(&mut rows, "vox_offset", "VoxOffset", h.vox_offset.to_string());
+    push(
+        &mut rows,
+        "magic",
+        "Magic",
+        String::from_utf8_lossy(&h.magic).trim_end().to_string(),
+    );
+    Ok(FileTags {
+        kind: "nifti".into(),
+        filename: fname(path),
+        rows,
+    })
+}
+
+// 常规图像（PNG/JPG/TIFF）：尽力读取格式头信息
+fn image_tags(path: &str, format_label: &str) -> Result<FileTags, String> {
+    let img = image::open(path).map_err(|e| format!("打开图像失败: {}", e))?;
+    let (w, h) = img.dimensions();
+    let color = img.color();
+    let mut rows: Vec<TagRow> = Vec::new();
+    rows.push(TagRow {
+        tag: "format".into(),
+        vr: "-".into(),
+        keyword: "Format".into(),
+        value: format_label.into(),
+    });
+    rows.push(TagRow {
+        tag: "width".into(),
+        vr: "-".into(),
+        keyword: "Width".into(),
+        value: w.to_string(),
+    });
+    rows.push(TagRow {
+        tag: "height".into(),
+        vr: "-".into(),
+        keyword: "Height".into(),
+        value: h.to_string(),
+    });
+    rows.push(TagRow {
+        tag: "colorType".into(),
+        vr: "-".into(),
+        keyword: "ColorType".into(),
+        value: format!("{:?}", color),
+    });
+    rows.push(TagRow {
+        tag: "bitsPerPixel".into(),
+        vr: "-".into(),
+        keyword: "BitsPerPixel".into(),
+        value: color.bits_per_pixel().to_string(),
+    });
+    if let Ok(meta) = std::fs::metadata(path) {
+        rows.push(TagRow {
+            tag: "fileSize".into(),
+            vr: "-".into(),
+            keyword: "FileSize".into(),
+            value: format!("{} bytes", meta.len()),
+        });
+    }
+    Ok(FileTags {
+        kind: "image".into(),
+        filename: fname(path),
+        rows,
+    })
+}
+
+#[tauri::command]
+fn file_tags(path: String) -> Result<FileTags, String> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".nii") || lower.ends_with(".nii.gz") {
+        nifti_tags(&path)
+    } else if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
+        dicom_tags(&path)
+    } else if lower.ends_with(".j2c") || lower.ends_with(".jph") {
+        // HTJ2K：复用解码器取尺寸/帧/光度（image crate 不支持 JPEG2000）
+        let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let img = decode_htj2k(&bytes)?;
+        let mut rows = vec![
+            TagRow {
+                tag: "format".into(),
+                vr: "-".into(),
+                keyword: "Format".into(),
+                value: "HTJ2K".into(),
+            },
+            TagRow {
+                tag: "width".into(),
+                vr: "-".into(),
+                keyword: "Width".into(),
+                value: img.meta.width.to_string(),
+            },
+            TagRow {
+                tag: "height".into(),
+                vr: "-".into(),
+                keyword: "Height".into(),
+                value: img.meta.height.to_string(),
+            },
+            TagRow {
+                tag: "frames".into(),
+                vr: "-".into(),
+                keyword: "Frames".into(),
+                value: img.meta.frames.to_string(),
+            },
+            TagRow {
+                tag: "photometric".into(),
+                vr: "-".into(),
+                keyword: "Photometric".into(),
+                value: img.meta.photometric.clone(),
+            },
+        ];
+        if let Ok(meta) = std::fs::metadata(&path) {
+            rows.push(TagRow {
+                tag: "fileSize".into(),
+                vr: "-".into(),
+                keyword: "FileSize".into(),
+                value: format!("{} bytes", meta.len()),
+            });
+        }
+        Ok(FileTags {
+            kind: "image".into(),
+            filename: fname(&path),
+            rows,
+        })
+    } else {
+        image_tags(&path, image_format_label(&lower))
+    }
+}
+
+// 从文件夹导入：扫描顶层影像文件，返回概要信息（不解码像素）
+#[tauri::command]
+fn list_folder_images(dir: String) -> Result<Vec<ImageInfo>, String> {
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("读取文件夹失败: {}", e))?;
+    let mut out: Vec<ImageInfo> = Vec::new();
+    for e in entries.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let path = p.to_string_lossy().to_string();
+        let lower = path.to_lowercase();
+        let kind = if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
+            "dicom"
+        } else if lower.ends_with(".j2c") || lower.ends_with(".jph") {
+            "htj2k"
+        } else if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".tif")
+            || lower.ends_with(".tiff")
+        {
+            "image"
+        } else {
+            continue; // 跳过不支持/非影像
+        };
+        // 单文件失败不影响整体，跳过即可
+        if let Ok(info) = folder_image_info(&path, kind) {
+            out.push(info);
+        }
+    }
+    out.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(out)
+}
+
+fn folder_image_info(path: &str, kind: &str) -> Result<ImageInfo, String> {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    if kind == "dicom" {
+        let obj = dicom_object::open_file(path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+        let (w, h, frames) = read_dicom_dims(&*obj)?;
+        Ok(ImageInfo {
+            path: path.to_string(),
+            filename,
+            width: w,
+            height: h,
+            frames,
+            kind: kind.into(),
+        })
+    } else if kind == "htj2k" {
+        let bytes = std::fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let img = decode_htj2k(&bytes)?;
+        Ok(ImageInfo {
+            path: path.to_string(),
+            filename,
+            width: img.meta.width,
+            height: img.meta.height,
+            frames: img.meta.frames,
+            kind: kind.into(),
+        })
+    } else {
+        let img = image::open(path).map_err(|e| format!("打开图像失败: {}", e))?;
+        let (w, h) = img.dimensions();
+        Ok(ImageInfo {
+            path: path.to_string(),
+            filename,
+            width: w,
+            height: h,
+            frames: 1,
+            kind: kind.into(),
+        })
+    }
+}
+
+fn attr_u32(obj: &InMemDicomObject, name: &str, default: u32) -> u32 {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .and_then(|s| {
+            s.trim()
+                .split('\\')
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .unwrap_or(default)
+}
+
+// 仅读头获取尺寸（不解码像素），用于文件夹导入的概要信息
+fn read_dicom_dims(obj: &InMemDicomObject) -> Result<(u32, u32, u32), String> {
+    let cols = attr_u32(obj, "Columns", 0);
+    let rows = attr_u32(obj, "Rows", 0);
+    let frames = attr_u32(obj, "NumberOfFrames", 1);
+    if cols == 0 || rows == 0 {
+        return Err("DICOM 缺少尺寸信息 (Columns/Rows)".into());
+    }
+    Ok((cols, rows, frames))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +1022,37 @@ mod tests {
 
         let center = hu[n / 2 + 256];
         assert!(center > -1024.0);
+    }
+
+    #[test]
+    fn file_tags_sample_dicom() {
+        let tags = file_tags("tests/sample.dcm".to_string()).expect("file_tags");
+        assert_eq!(tags.kind, "dicom");
+        assert!(!tags.rows.is_empty(), "DICOM 标签不应为空");
+        // 至少应含 Modality (0008,0060)
+        assert!(
+            tags.rows.iter().any(|r| r.tag == "(0008,0060)"),
+            "应含 Modality 标签 (0008,0060)"
+        );
+        // 像素数据应被省略，不得作为标签值
+        assert!(
+            !tags.rows.iter().any(|r| r.value.contains("像素数据已省略") && r.tag != "(7FE0,0010)"),
+            "非像素数据元素不应被省略"
+        );
+    }
+
+    #[test]
+    fn list_folder_images_cbct() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
+        let infos = list_folder_images(dir.to_string_lossy().to_string()).expect("list_folder_images");
+        assert!(infos.len() > 100, "CBCT 文件夹应扫描到大量影像，实际 {}", infos.len());
+        // 排序后首文件应为 0000.dcm
+        assert_eq!(infos[0].filename, "0000.dcm");
+        let first = &infos[0];
+        assert_eq!(first.kind, "dicom");
+        assert_eq!(first.width, 390);
+        assert_eq!(first.height, 390);
+        assert_eq!(first.frames, 1);
     }
 
     #[test]
@@ -920,7 +1294,9 @@ pub fn run() {
             load_nifti,
             load_htj2k,
             export_frame,
-            batch_export
+            batch_export,
+            file_tags,
+            list_folder_images
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -48,6 +48,29 @@ export interface BatchResult {
   failed: BatchFail[];
 }
 
+// 从文件夹导入：顶层影像文件概要（不含像素，前端懒加载）
+export interface ImageInfo {
+  path: string;
+  filename: string;
+  width: number;
+  height: number;
+  frames: number;
+  kind: string; // "dicom" | "image" | "htj2k"
+}
+
+// 详情对话框：文件标签信息
+export interface TagRow {
+  tag: string;
+  vr: string;
+  keyword: string;
+  value: string;
+}
+export interface FileTags {
+  kind: string; // "dicom" | "nifti" | "image"
+  filename: string;
+  rows: TagRow[];
+}
+
 // 将后端返回的像素字节解码为 Float32Array。
 // 像素顺序为 [frame][row][col]，长度为 width*height*frames。
 // 兼容三种形态（Tauri v2 JSON IPC 下 serde_bytes 的 Vec<u8> 会退化为 number[]）：

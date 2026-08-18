@@ -9,7 +9,6 @@ const props = defineProps<{
   meta: DicomMeta;
   frames: Float32Array[]; // 每帧 HU 数组，长度 = width*height
 }>();
-const emit = defineEmits<{ close: [] }>();
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const wc = ref(props.meta.windowCenter);
@@ -125,6 +124,14 @@ function onUp() {
   dragging = false;
 }
 
+function resetView() {
+  zoom.value = 1;
+  pan.value = { x: 0, y: 0 };
+  wc.value = props.meta.windowCenter;
+  ww.value = props.meta.windowWidth;
+  frameIndex.value = 0;
+}
+
 // 导出当前帧（按当前窗设置）为 PNG/JPEG/HTJ2K
 const exportFormat = ref<"png" | "jpeg" | "htj2k">("png");
 const exportQuality = ref(90);
@@ -158,8 +165,8 @@ async function onExport() {
       fmt === "png"
         ? [{ name: "PNG", extensions: ["png"] }]
         : fmt === "jpeg"
-        ? [{ name: "JPEG", extensions: ["jpg", "jpeg"] }]
-        : [{ name: "HTJ2K", extensions: ["jph", "j2c"] }];
+          ? [{ name: "JPEG", extensions: ["jpg", "jpeg"] }]
+          : [{ name: "HTJ2K", extensions: ["jph", "j2c"] }];
     const out = await save({ defaultPath: suggested, filters });
     if (!out) return; // 用户取消
     const saved = await invoke<string>("export_frame", {
@@ -186,128 +193,180 @@ async function onExport() {
 
 <template>
   <div class="viewer">
-    <div class="toolbar">
-      <span class="file" :title="meta.path">{{ meta.filename }}</span>
-      <label>窗位
-        <input type="range" :min="meta.huMin" :max="meta.huMax" step="1" v-model.number="wc" />
-        <span class="val">{{ wc }}</span>
-      </label>
-      <label>窗宽
-        <input type="range" :min="1" :max="Math.max(1, meta.huMax - meta.huMin)" step="1" v-model.number="ww" />
-        <span class="val">{{ ww }}</span>
-      </label>
-      <label v-if="meta.frames > 1">帧
-        <input type="range" min="0" :max="meta.frames - 1" step="1" v-model.number="frameIndex" />
-        <span class="val">{{ frameIndex + 1 }}/{{ meta.frames }}</span>
-      </label>
-      <button class="reset" @click="() => { zoom = 1; pan = { x: 0, y: 0 }; wc = meta.windowCenter; ww = meta.windowWidth; frameIndex = 0; }">重置</button>
-      <button class="close" @click="emit('close')">关闭</button>
-      <span class="zoom">缩放 {{ zoom.toFixed(2) }}x</span>
+    <div class="stage">
+      <canvas
+        ref="canvasRef"
+        class="canvas"
+        @wheel.prevent="onWheel"
+        @mousedown="onDown"
+        @mousemove="onMove"
+        @mouseup="onUp"
+        @mouseleave="onUp"
+      />
+      <div class="zoom-badge">{{ zoom.toFixed(2) }}x</div>
     </div>
-    <div class="export-bar">
-      <label class="export-label">导出
-        <select v-model="exportFormat">
-          <option value="png">PNG</option>
-          <option value="jpeg">JPEG</option>
-          <option value="htj2k">HTJ2K</option>
-        </select>
-      </label>
-      <label v-if="exportFormat === 'jpeg'" class="export-label">质量
-        <input type="range" min="10" max="100" step="1" v-model.number="exportQuality" />
-        <span class="val">{{ exportQuality }}</span>
-      </label>
-      <button class="export-btn" :disabled="!isRealFile || exporting" @click="onExport">
-        {{ exporting ? "导出中…" : "导出当前帧" }}
-      </button>
-      <span v-if="!isRealFile" class="hint-sm">示例数据不可导出</span>
-      <span v-if="exportMsg" class="export-msg" :class="{ ok: exportMsg.startsWith('已导出') }">{{ exportMsg }}</span>
-    </div>
-    <div class="meta-bar">
-      {{ meta.width }}×{{ meta.height }} · {{ meta.frames }} 帧 · {{ meta.bitsStored }}bit ·
-      {{ meta.photometric }} · slope {{ meta.slope }} intercept {{ meta.intercept }}
-    </div>
-    <canvas
-      ref="canvasRef"
-      class="canvas"
-      @wheel.prevent="onWheel"
-      @mousedown="onDown"
-      @mousemove="onMove"
-      @mouseup="onUp"
-      @mouseleave="onUp"
-    />
+
+    <aside class="side">
+      <section class="group">
+        <div class="group-title">
+          <span>视图</span>
+          <span class="group-actions">
+            <button class="mini" @click="resetView">重置</button>
+          </span>
+        </div>
+        <label>
+          窗位
+          <input type="range" :min="meta.huMin" :max="meta.huMax" step="1" v-model.number="wc" />
+          <span class="val">{{ wc }}</span>
+        </label>
+        <label>
+          窗宽
+          <input
+            type="range"
+            :min="1"
+            :max="Math.max(1, meta.huMax - meta.huMin)"
+            step="1"
+            v-model.number="ww"
+          />
+          <span class="val">{{ ww }}</span>
+        </label>
+        <label v-if="meta.frames > 1">
+          帧
+          <input type="range" min="0" :max="meta.frames - 1" step="1" v-model.number="frameIndex" />
+          <span class="val">{{ frameIndex + 1 }}/{{ meta.frames }}</span>
+        </label>
+      </section>
+
+      <section class="group export">
+        <div class="group-title"><span>导出</span></div>
+        <label class="export-label">
+          格式
+          <select v-model="exportFormat">
+            <option value="png">PNG</option>
+            <option value="jpeg">JPEG</option>
+            <option value="htj2k">HTJ2K</option>
+          </select>
+        </label>
+        <label v-if="exportFormat === 'jpeg'" class="export-label">
+          质量
+          <input type="range" min="10" max="100" step="1" v-model.number="exportQuality" />
+          <span class="val">{{ exportQuality }}</span>
+        </label>
+        <button class="export-btn" :disabled="!isRealFile || exporting" @click="onExport">
+          {{ exporting ? "导出中…" : "导出当前帧" }}
+        </button>
+        <span v-if="!isRealFile" class="hint-sm">示例数据不可导出</span>
+        <span
+          v-if="exportMsg"
+          class="export-msg"
+          :class="{ ok: exportMsg.startsWith('已导出') }"
+          >{{ exportMsg }}</span
+        >
+      </section>
+    </aside>
   </div>
 </template>
 
 <style scoped>
 .viewer {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100%;
 }
-.toolbar {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  padding: 8px 12px;
+.stage {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  background: #000;
+}
+.canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+.canvas:active {
+  cursor: grabbing;
+}
+
+/* 右侧工具栏 */
+.side {
+  width: 248px;
+  flex: 0 0 248px;
+  border-left: 1px solid var(--border);
   background: var(--panel);
+  padding: 12px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.side-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
   border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
+  padding-bottom: 4px;
 }
-.toolbar .file {
-  font-size: 12px;
-  font-weight: 600;
+.group-actions {
+  display: flex;
+  gap: 6px;
+}
+.mini {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.mini:hover {
   color: var(--fg);
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  border-color: var(--fg-dim);
 }
-.toolbar label {
+.side label {
   display: flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
   color: var(--fg-dim);
 }
-.toolbar .val {
+.side .val {
   color: var(--fg);
-  min-width: 44px;
+  min-width: 48px;
   text-align: right;
 }
-.reset,
-.close {
-  background: transparent;
-  color: var(--fg-dim);
-  border: 1px solid var(--border);
+.side input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+/* 缩放比例指示已移至画布右下角 */
+.zoom-badge {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  padding: 2px 8px;
   border-radius: 4px;
-  padding: 4px 10px;
-  cursor: pointer;
   font-size: 12px;
-}
-.reset:hover,
-.close:hover {
-  color: var(--fg);
-}
-.zoom {
-  font-size: 12px;
-  color: var(--fg-dim);
-  margin-left: auto;
-}
-.meta-bar {
-  padding: 4px 12px;
-  font-size: 11px;
-  color: var(--fg-dim);
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-}
-.export-bar {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  padding: 6px 12px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  flex-wrap: wrap;
+  pointer-events: none;
+  user-select: none;
 }
 .export-label {
   display: flex;
@@ -321,19 +380,14 @@ async function onExport() {
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 2px 4px;
-}
-.export-label .val {
-  color: var(--fg);
-  min-width: 28px;
-  text-align: right;
+  padding: 3px 6px;
 }
 .export-btn {
   background: var(--accent);
   color: #fff;
   border: none;
   border-radius: 4px;
-  padding: 4px 12px;
+  padding: 7px 12px;
   cursor: pointer;
   font-size: 12px;
 }
@@ -352,15 +406,5 @@ async function onExport() {
 .hint-sm {
   font-size: 11px;
   color: var(--fg-dim);
-}
-.canvas {
-  flex: 1;
-  width: 100%;
-  background: #000;
-  cursor: grab;
-  display: block;
-}
-.canvas:active {
-  cursor: grabbing;
 }
 </style>
