@@ -6,12 +6,15 @@ import type {
   DicomImage,
   NiftiMeta,
   NiftiVolume,
-  BatchResult,
   ImageInfo,
   FileTags,
+  SeriesFields,
+  SeriesTree,
+  SeriesBrief,
+  StudyBrief,
 } from "./types";
 import { decodePixelBytes } from "./types";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import aboutIcon from "./assets/about-icon.png";
@@ -32,12 +35,6 @@ const openSeq = ref(0);
 
 const loading = ref(false);
 const error = ref<string | null>(null);
-
-// 批量导出
-const batchFormat = ref<"png" | "jpeg" | "htj2k">("png");
-const batchQuality = ref(90);
-const batchResult = ref<BatchResult | null>(null);
-const batchBusy = ref(false);
 
 // 菜单栏
 const openMenu = ref<"file" | "help" | null>(null);
@@ -115,6 +112,7 @@ async function loadByKind(path: string, kind: string): Promise<ImageView> {
 function clearImages() {
   imageList.value = [];
   activeId.value = null;
+  currentView.value = null;
 }
 function clearNifti() {
   niftiView.value = null;
@@ -145,9 +143,26 @@ async function openFile() {
             ? "dicom"
             : "image";
       const view = await loadByKind(selected, kind);
+      const info = infoFromMeta(view.meta, selected, kind);
+      // 单张 DICOM 打开时也读取系列字段，便于后续系列分组/切换
+      if (kind === "dicom") {
+        try {
+          const sf = await invoke<SeriesFields>("file_series_info", { path: selected });
+          info.seriesUid = sf.seriesUid ?? null;
+          info.seriesNumber = sf.seriesNumber ?? null;
+          info.modality = sf.modality ?? null;
+          info.instanceNumber = sf.instanceNumber ?? null;
+          info.sliceLocation = sf.sliceLocation ?? null;
+          info.imagePosPatient = sf.imagePosPatient ?? null;
+          info.imageOrientation = sf.imageOrientation ?? null;
+        } catch {
+          /* 系列信息缺失不影响打开 */
+        }
+      }
       idSeq.value++;
-      imageList.value = [{ id: idSeq.value, info: infoFromMeta(view.meta, selected, kind), view }];
+      imageList.value = [{ id: idSeq.value, info, view }];
       activeId.value = idSeq.value;
+      currentView.value = view;
       clearNifti();
     }
   } catch (e) {
@@ -160,16 +175,92 @@ async function openFile() {
   }
 }
 
-// 从文件夹导入（仅顶层文件，形成可切换的多图列表；像素按需懒加载）
+// 从文件夹导入：递归扫描，按 Study/Series 两级分组；单一序列直接打开，多序列弹对话框选择
 async function importFolder() {
   error.value = null;
   listLoading.value = true;
   try {
     const dir = await open({ directory: true, title: "选择包含影像的文件夹" });
     if (!dir || Array.isArray(dir)) return;
-    const infos = await invoke<ImageInfo[]>("list_folder_images", { dir });
-    if (!infos.length) {
+    const tree = await invoke<SeriesTree>("scan_folder_series", { dir });
+    const all: SeriesBrief[] = [
+      ...tree.studies.flatMap((s) => s.series),
+      ...(tree.others ? [tree.others] : []),
+    ];
+    if (!all.length) {
       error.value = "该文件夹未找到可识别的影像文件";
+      return;
+    }
+    if (all.length === 1) {
+      // 仅一个序列：直接打开该序列并进入主界面
+      await loadSeries(all[0]);
+    } else {
+      // 多个序列：弹出选择对话框
+      seriesTree.value = tree;
+      selectedSeries.value = null;
+      seriesSelectOpen.value = true;
+    }
+  } catch (e) {
+    error.value =
+      typeof e === "string"
+        ? e
+        : (e as { message?: string })?.message ?? String(e);
+  } finally {
+    listLoading.value = false;
+  }
+}
+
+const seriesTree = ref<SeriesTree | null>(null);
+const seriesSelectOpen = ref(false);
+const selectedSeries = ref<SeriesBrief | null>(null);
+
+// 供对话框渲染：把 others（非 DICOM）作为一个伪 Study 归入列表，统一两级展示
+const selectStudies = computed<StudyBrief[]>(() => {
+  const t = seriesTree.value;
+  if (!t) return [];
+  if (t.others) {
+    return [
+      ...t.studies,
+      {
+        studyUid: null,
+        patientName: null,
+        patientId: null,
+        studyDate: null,
+        series: [t.others],
+      },
+    ];
+  }
+  return t.studies;
+});
+
+function pickSeries(s: SeriesBrief) {
+  selectedSeries.value = s;
+}
+function closeSeriesSelect() {
+  seriesSelectOpen.value = false;
+  seriesTree.value = null;
+  selectedSeries.value = null;
+}
+// 仅加载所选序列（用户从对话框确认的那个）
+async function confirmSeries() {
+  if (!selectedSeries.value) return;
+  seriesSelectOpen.value = false;
+  const s = selectedSeries.value;
+  selectedSeries.value = null;
+  seriesTree.value = null;
+  await loadSeries(s);
+}
+
+// 把单个序列的文件路径构建为可显示的图像列表（懒加载像素）
+async function loadSeries(series: SeriesBrief) {
+  error.value = null;
+  listLoading.value = true;
+  try {
+    const infos = await invoke<ImageInfo[]>("load_series_files", {
+      paths: series.paths,
+    });
+    if (!infos.length) {
+      error.value = "所选序列未找到可识别的影像文件";
       return;
     }
     const list: OpenedImage[] = infos.map((info) => ({
@@ -180,7 +271,8 @@ async function importFolder() {
     imageList.value = list;
     activeId.value = list[0].id;
     clearNifti();
-    await ensureLoaded(list[0].id);
+    await decodeItem(list[0]);
+    currentView.value = list[0].view;
   } catch (e) {
     error.value =
       typeof e === "string"
@@ -192,32 +284,55 @@ async function importFolder() {
 }
 
 const currentItem = computed(() => imageList.value.find((i) => i.id === activeId.value) ?? null);
-const currentView = computed(() => currentItem.value?.view ?? null);
+// 当前展示的图像视图（已解码）。用 ref 而非 computed：切换到未解码切片时保留上一帧，
+// 后台解码完成后再无感替换，避免 Viewer 因 currentView 变 null 而卸载 → 消除闪烁。
+const currentView = ref<ImageView | null>(null);
+// 切换令牌：快速拖动时只采用最新一次请求的 decode 结果，过期的中间结果丢弃。
+let loadSeq = 0;
 const currentPath = computed(
   () => currentItem.value?.info.path ?? niftiView.value?.meta.path ?? null
 );
 
-// 选中下拉项或首次导入时，懒加载该图像的像素
-async function ensureLoaded(id: number) {
-  const item = imageList.value.find((i) => i.id === id);
-  if (!item || item.view) return;
-  listLoading.value = true;
-  try {
-    item.view = await loadByKind(item.info.path, item.info.kind);
-  } catch (e) {
-    error.value =
-      typeof e === "string"
-        ? e
-        : (e as { message?: string })?.message ?? String(e);
-  } finally {
-    listLoading.value = false;
-  }
+// 当前选中文件所属系列的有序文件列表（按位置排序）；供查看器右侧竖滚动条做切片快速切换
+const seriesFiles = computed(() => {
+  const cur = currentItem.value;
+  if (!cur || cur.info.seriesGroup == null) return [];
+  const g = cur.info.seriesGroup;
+  return imageList.value.filter((i) => i.info.seriesGroup === g);
+});
+
+// 解码单个图像像素（不触碰导入 spinner，供滚动按需调用，结果缓存到 item.view）
+async function decodeItem(item: OpenedImage) {
+  if (item.view) return;
+  item.view = await loadByKind(item.info.path, item.info.kind);
 }
 
+// 切换激活图像：已解码则即时切换；未解码则在后台解码，期间保留上一帧显示
+// （Viewer 常驻不复挂载，currentView 始终非 null → 绝不闪烁）。
 function selectImage(id: number) {
+  if (id === activeId.value && currentView.value) return;
   activeId.value = id;
   closeMenu();
-  ensureLoaded(id);
+  const item = imageList.value.find((i) => i.id === id);
+  if (!item) return;
+  if (item.view) {
+    currentView.value = item.view;
+    return;
+  }
+  const seq = ++loadSeq;
+  decodeItem(item)
+    .then(() => {
+      if (seq !== loadSeq) return; // 已被更新的切换请求取代，丢弃陈旧结果
+      const it = imageList.value.find((i) => i.id === id);
+      if (it?.view) currentView.value = it.view;
+    })
+    .catch((e) => {
+      if (seq !== loadSeq) return;
+      error.value =
+        typeof e === "string"
+          ? e
+          : (e as { message?: string })?.message ?? String(e);
+    });
 }
 
 // MPR：按轴把 3D 体重排为若干帧（体顺序 [x][y][z]，z 最内）
@@ -308,6 +423,25 @@ const statusFrames = computed(() => {
   return m?.frames ?? i?.frames ?? 0;
 });
 const canShowDetails = computed(() => currentPath.value !== null);
+
+// 状态栏下拉分组：按 seriesGroup 聚合（同系列归一组；不属于任何系列的文件各自独立）
+const groupedImages = computed(() => {
+  const groups: { key: string; group: number | null; label: string | null; items: OpenedImage[] }[] =
+    [];
+  const idx = new Map<string, number>();
+  for (const it of imageList.value) {
+    const g = it.info.seriesGroup ?? null;
+    const key = g === null ? "u" + it.id : "g" + g;
+    if (idx.has(key)) groups[idx.get(key)!].items.push(it);
+    else {
+      idx.set(key, groups.length);
+      groups.push({ key, group: g, label: it.info.seriesLabel ?? null, items: [it] });
+    }
+  }
+  return groups;
+});
+
+// 标签搜索过滤
 const filteredTags = computed(() => {
   if (!detailsTags.value) return [];
   const q = detailsQuery.value.trim().toLowerCase();
@@ -350,6 +484,40 @@ watch(
   { flush: "post" }
 );
 
+// 标签信息导出（在系统保存框中选择 JSON / CSV 格式）
+const exportingTags = ref(false);
+const exportTagsMsg = ref<string | null>(null);
+async function exportTags() {
+  if (!detailsTags.value) return;
+  const base = (detailsTags.value.filename || "tags").replace(/\.[^.]+$/, "");
+  const out = await save({
+    defaultPath: base,
+    filters: [
+      { name: "JSON", extensions: ["json"] },
+      { name: "CSV", extensions: ["csv"] },
+    ],
+  });
+  if (!out) return; // 用户取消
+  // 按用户在保存框中选择的扩展名推断格式
+  const fmt = out.toLowerCase().endsWith(".csv") ? "csv" : "json";
+  exportingTags.value = true;
+  exportTagsMsg.value = null;
+  try {
+    await invoke("export_tags", {
+      path: out,
+      format: fmt,
+      rows: detailsTags.value.rows,
+    });
+    exportTagsMsg.value = `已导出：${out}`;
+  } catch (e) {
+    exportTagsMsg.value =
+      "导出失败：" +
+      (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
+  } finally {
+    exportingTags.value = false;
+  }
+}
+
 async function openDetails() {
   const path = currentPath.value;
   if (!path) return;
@@ -369,36 +537,6 @@ async function openDetails() {
   } finally {
     detailsLoading.value = false;
   }
-}
-
-async function batchExport() {
-  error.value = null;
-  batchResult.value = null;
-  batchBusy.value = true;
-  try {
-    const files = await open({ multiple: true, filters: fileFilters });
-    if (!files || typeof files === "string") return;
-    const dir = await open({ directory: true, title: "选择批量导出目录" });
-    if (!dir || Array.isArray(dir)) return;
-    const res = await invoke<BatchResult>("batch_export", {
-      paths: files,
-      format: batchFormat.value,
-      quality: batchQuality.value,
-      outDir: dir,
-    });
-    batchResult.value = res;
-  } catch (e) {
-    error.value =
-      typeof e === "string"
-        ? e
-        : (e as { message?: string })?.message ?? String(e);
-  } finally {
-    batchBusy.value = false;
-  }
-}
-
-function dismissBatch() {
-  batchResult.value = null;
 }
 
 // 生成示例体数据（前端联调用，后端就绪后可对照真实 DICOM）
@@ -447,6 +585,7 @@ const useMock = () => {
     { id: idSeq.value, info: infoFromMeta(mock.meta, "mock://phantom", "dicom"), view: mock },
   ];
   activeId.value = idSeq.value;
+  currentView.value = mock;
   clearNifti();
 };
 
@@ -469,7 +608,6 @@ onMounted(async () => {
           <div v-if="openMenu === 'file'" class="dropdown" @click.stop>
             <button @click="openFile">打开文件…</button>
             <button @click="importFolder">从文件夹导入…</button>
-            <button @click="batchExport">批量导出…</button>
           </div>
         </div>
         <div class="menu" :class="{ open: openMenu === 'help' }" @click="toggleMenu('help')">
@@ -488,25 +626,14 @@ onMounted(async () => {
     <!-- 点击空白处关闭菜单的遮罩 -->
     <div v-if="openMenu" class="menu-overlay" @click="closeMenu"></div>
 
-    <div v-if="batchResult" class="batch-banner">
-      <span>
-        批量导出完成：成功 <b>{{ batchResult.ok }}</b> 张，失败
-        <b>{{ batchResult.failed.length }}</b> 张
-      </span>
-      <ul v-if="batchResult.failed.length">
-        <li v-for="f in batchResult.failed" :key="f.path">
-          ⚠ {{ f.path }} — {{ f.error }}
-        </li>
-      </ul>
-      <button class="close" @click="dismissBatch">关闭</button>
-    </div>
-
     <main>
       <template v-if="currentView">
         <Viewer
-          :key="'img-' + activeId"
           :meta="currentView.meta"
           :frames="currentView.frames"
+          :series-files="seriesFiles"
+          :active-id="activeId"
+          @select-file="selectImage"
         />
       </template>
       <template v-else-if="niftiView">
@@ -538,6 +665,9 @@ onMounted(async () => {
           <button :disabled="loading" @click="openFile">
             {{ loading ? "解码中…" : "打开文件" }}
           </button>
+          <button :disabled="listLoading" @click="importFolder">
+            {{ listLoading ? "导入中…" : "从文件夹导入" }}
+          </button>
           <button class="ghost" @click="useMock">载入示例体数据（mock）</button>
           <p v-if="error" class="err">⚠ {{ error }}</p>
           <p class="hint">
@@ -556,9 +686,16 @@ onMounted(async () => {
           :value="activeId"
           @change="selectImage(Number(($event.target as HTMLSelectElement).value))"
         >
-          <option v-for="it in imageList" :key="it.id" :value="it.id">
-            {{ it.info.filename }}
-          </option>
+          <template v-for="grp in groupedImages" :key="grp.key">
+            <optgroup v-if="grp.group !== null" :label="grp.label || '系列'">
+              <option v-for="it in grp.items" :key="it.id" :value="it.id">
+                {{ it.info.filename }}
+              </option>
+            </optgroup>
+            <option v-else :key="grp.items[0].id" :value="grp.items[0].id">
+              {{ grp.items[0].info.filename }}
+            </option>
+          </template>
         </select>
         <span v-else class="status-file" :title="statusName">{{ statusName }}</span>
       </template>
@@ -589,21 +726,79 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- 序列选择对话框（文件夹导入含多个序列时弹出） -->
+    <div v-if="seriesSelectOpen" class="modal-mask" @click.self="closeSeriesSelect">
+      <div class="modal series-select">
+        <div class="ss-head">
+          <h2>选择要显示的序列</h2>
+          <button class="modal-close-x" @click="closeSeriesSelect" aria-label="关闭">×</button>
+        </div>
+        <div class="ss-body">
+          <div v-for="st in selectStudies" :key="st.studyUid || 'others'" class="ss-study">
+            <div class="ss-study-title">
+              <span class="ss-mod">{{ st.studyUid == null ? "其他影像文件" : st.patientName || "未知患者" }}</span>
+              <span class="ss-sub" v-if="st.studyUid != null">
+                Study {{ st.studyUid.slice(-12) }}
+                <template v-if="st.studyDate"> · {{ st.studyDate }}</template>
+                <template v-if="st.patientId"> · {{ st.patientId }}</template>
+              </span>
+            </div>
+            <button
+              v-for="s in st.series"
+              :key="s.seriesUid || s.seriesDescription || 's'"
+              class="ss-row"
+              :class="{ active: selectedSeries === s }"
+              @click="pickSeries(s)"
+              @dblclick="pickSeries(s); confirmSeries()"
+            >
+              <span class="ss-row-main">
+                <b>{{ s.modality || "?" }}<template v-if="s.seriesNumber != null"> #{{ s.seriesNumber }}</template></b>
+                <span class="ss-desc">{{ s.seriesDescription || "未命名序列" }}</span>
+              </span>
+              <span class="ss-row-meta">
+                <span v-if="s.seriesDate">序列日期 {{ s.seriesDate }}</span>
+                <span v-if="s.patientName">患者 {{ s.patientName }}</span>
+                <span>{{ s.fileCount }} 文件</span>
+              </span>
+            </button>
+          </div>
+        </div>
+        <div class="ss-foot">
+          <button class="ss-cancel" @click="closeSeriesSelect">取消</button>
+          <button class="ss-ok" :disabled="!selectedSeries" @click="confirmSeries">打开所选序列</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 详情对话框 -->
     <div v-if="detailsOpen" class="modal-mask" @click.self="detailsOpen = false">
-      <div class="modal details">
-        <div class="details-head">
-          <h2>文件标签信息</h2>
-          <span class="details-file">{{ detailsTags?.filename }}</span>
-          <span class="status-spacer"></span>
-          <input
-            v-model="detailsQuery"
-            class="details-search"
-            placeholder="搜索标签 / 关键字 / 值…"
-          />
-          <button class="modal-close" @click="detailsOpen = false">关闭</button>
-        </div>
+        <div class="modal details">
+          <button class="modal-close-x" @click="detailsOpen = false" aria-label="关闭">×</button>
+          <div class="details-head">
+            <h2>文件标签信息</h2>
+            <span class="details-file">{{ detailsTags?.filename }}</span>
+            <span class="status-spacer"></span>
+            <button
+              class="modal-export"
+              :disabled="!detailsTags || exportingTags"
+              @click="exportTags"
+            >
+              {{ exportingTags ? "导出中…" : "导出" }}
+            </button>
+            <input
+              v-model="detailsQuery"
+              class="details-search"
+              placeholder="搜索标签 / 关键字 / 值…"
+            />
+          </div>
         <div class="details-body">
+          <div
+            v-if="exportTagsMsg"
+            class="export-tags-msg"
+            :class="{ ok: exportTagsMsg.startsWith('已导出') }"
+          >
+            {{ exportTagsMsg }}
+          </div>
           <div v-if="detailsLoading" class="details-loading">读取中…</div>
           <div v-else-if="detailsError" class="details-err">⚠ {{ detailsError }}</div>
           <table v-else-if="detailsTags" class="tags-table">
@@ -620,7 +815,16 @@ onMounted(async () => {
               <tr v-for="r in filteredTags" :key="r.tag">
                 <td class="mono">{{ r.tag }}</td>
                 <td>{{ r.vr }}</td>
-                <td>{{ r.keyword }}</td>
+                <td>
+                  {{ r.keyword }}
+                  <span v-if="r.description" class="qmark"
+                    >?
+                    <span class="qtip">
+                      <b>{{ r.keyword }}</b>
+                      <span class="qtip-desc">{{ r.description }}</span>
+                    </span>
+                  </span>
+                </td>
                 <td
                   class="val"
                   :class="{ expanded: expandedTags.has(r.tag) }"
@@ -861,30 +1065,6 @@ main {
   cursor: default;
 }
 
-/* 批量横幅 */
-.batch-banner {
-  padding: 8px 20px;
-  background: #16331f;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-  color: #c8f0d4;
-}
-.batch-banner ul {
-  margin: 4px 0 0;
-  padding-left: 18px;
-  color: #e5a3a3;
-  max-height: 120px;
-  overflow: auto;
-}
-.batch-banner .close {
-  margin-left: 12px;
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--fg-dim);
-  border-radius: 4px;
-  cursor: pointer;
-}
-
 /* 对话框 */
 .modal-mask {
   position: fixed;
@@ -949,12 +1129,14 @@ main {
   display: flex;
   flex-direction: column;
   padding: 0;
+  position: relative;
 }
 .details-head {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 14px 18px;
+  /* 右侧预留空间，避免搜索框压到右上角关闭叉 */
+  padding: 14px 44px 14px 18px;
   border-bottom: 1px solid var(--border);
 }
 .details-head h2 {
@@ -976,7 +1158,100 @@ main {
   border-radius: 6px;
   padding: 5px 10px;
   font-size: 12px;
-  width: 220px;
+  width: 180px;
+}
+/* 右上角关闭叉 */
+.modal-close-x {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 26px;
+  height: 26px;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 20px;
+  line-height: 1;
+  border-radius: 6px;
+  cursor: pointer;
+  z-index: 2;
+}
+.modal-close-x:hover {
+  background: var(--bg);
+  color: var(--fg);
+}
+/* 导出格式与按钮 */
+.details-export-fmt {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.modal-export {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.modal-export:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.export-tags-msg {
+  padding: 8px 18px;
+  font-size: 12px;
+  color: #e5484d;
+  border-bottom: 1px solid var(--border);
+}
+.export-tags-msg.ok {
+  color: #2e9e5b;
+}
+/* 关键字后的圆形问号与悬停说明 */
+.qmark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--fg-dim);
+  color: var(--panel);
+  font-size: 10px;
+  cursor: help;
+  position: relative;
+  vertical-align: middle;
+}
+.qtip {
+  display: none;
+  position: absolute;
+  left: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 260px;
+  padding: 8px 10px;
+  background: #1c1c22;
+  color: #f0f0f3;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  z-index: 80;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  white-space: normal;
+}
+.qmark:hover .qtip {
+  display: block;
+}
+.qtip-desc {
+  display: block;
+  margin: 2px 0;
+  color: #cdd2ff;
 }
 .details-body {
   overflow: auto;
@@ -1065,5 +1340,134 @@ main {
   text-align: center;
   color: var(--fg-dim);
   padding: 20px;
+}
+
+/* 序列选择对话框 */
+.modal.series-select {
+  width: min(720px, 92vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  position: relative;
+}
+.ss-head {
+  display: flex;
+  align-items: center;
+  padding: 14px 44px 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.ss-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.ss-body {
+  overflow: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ss-study {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ss-study-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 2px 4px;
+}
+.ss-study-title .ss-mod {
+  font-size: 13px;
+  color: var(--fg);
+  font-weight: 600;
+}
+.ss-study-title .ss-sub {
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.ss-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.ss-row:hover {
+  border-color: var(--fg-dim);
+}
+.ss-row.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.ss-row.active .ss-desc,
+.ss-row.active .ss-row-meta {
+  color: rgba(255, 255, 255, 0.85);
+}
+.ss-row-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.ss-row-main b {
+  white-space: nowrap;
+}
+.ss-desc {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ss-row-meta {
+  display: flex;
+  gap: 10px;
+  flex: 0 0 auto;
+  color: var(--fg-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ss-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+.ss-cancel {
+  background: transparent;
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ss-cancel:hover {
+  color: var(--fg);
+  border-color: var(--fg-dim);
+}
+.ss-ok {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 18px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ss-ok:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>

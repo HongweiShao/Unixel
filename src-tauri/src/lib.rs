@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use dicom_pixeldata::PixelDecoder;
-use serde::Serialize;
-use std::path::Path;
+use serde::{Serialize, Deserialize};
+use std::path::{Path, PathBuf};
 
 use dicom_core::Tag;
 use dicom_core::dictionary::DataDictionary;
@@ -57,29 +57,15 @@ struct NiftiVolume {
     voxel_bytes: Vec<u8>, // f32 LE，顺序 [x][y][z]，长度 = nx*ny*nz
 }
 
-// 批量导出结果
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchResult {
-    ok: usize,
-    failed: Vec<BatchFail>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchFail {
-    path: String,
-    error: String,
-}
-
 // 详情对话框：文件标签信息（DICOM 全量标签 / NIfTI 头 / 图像格式头）
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TagRow {
-    tag: String,     // DICOM: "(gggg,eeee)"；其他: 字段名
-    vr: String,      // DICOM: VR；其他: "-"
+    tag: String, // DICOM: "(gggg,eeee)"；其他: 字段名
+    vr: String,  // DICOM: VR；其他: "-"
     keyword: String, // DICOM: 标准字典关键字；其他: 人类可读标签
     value: String,
+    description: String, // DICOM: 标签中文释义（innolitics 风格：含义+常见值），缺省回退 VR 含义；其它类型留空（前端不显示问号）
 }
 
 #[derive(Serialize)]
@@ -91,7 +77,7 @@ struct FileTags {
 }
 
 // 从文件夹导入：仅返回顶层影像文件的概要信息（不含像素），前端按需懒加载像素
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ImageInfo {
     path: String,
@@ -100,6 +86,53 @@ struct ImageInfo {
     height: u32,
     frames: u32,
     kind: String, // "dicom" | "image" | "htj2k"
+    // 系列与位置信息（用于按系列分组、位置排序、系列内切换；非 DICOM 均为 None）
+    series_uid: Option<String>,
+    series_number: Option<u32>,
+    modality: Option<String>,
+    instance_number: Option<u32>,
+    slice_location: Option<f64>,
+    image_pos_patient: Option<Vec<f64>>, // 3 个分量
+    image_orientation: Option<Vec<f64>>, // 6 个分量（行/列方向余弦）
+    // 分组展示用（后端已算好）：同系列 series_group 相同；series_label 作为 optgroup 标题
+    series_group: Option<u32>,
+    series_label: Option<String>,
+}
+
+// 序列选择对话框：单个序列概要（来自 scan_folder_series）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SeriesBrief {
+    study_uid: Option<String>,
+    series_uid: Option<String>,
+    modality: Option<String>,
+    series_number: Option<u32>,
+    series_description: Option<String>,
+    patient_name: Option<String>,
+    patient_id: Option<String>,
+    series_date: Option<String>,
+    study_date: Option<String>,
+    file_count: usize,
+    paths: Vec<String>,
+}
+
+// 序列选择对话框：单个检查（Study）及其下序列
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StudyBrief {
+    study_uid: Option<String>,
+    patient_name: Option<String>,
+    patient_id: Option<String>,
+    study_date: Option<String>,
+    series: Vec<SeriesBrief>,
+}
+
+// 序列选择对话框：整体树（DICOM 按 Study→Series 两级；非 DICOM 归入 others）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SeriesTree {
+    studies: Vec<StudyBrief>,
+    others: Option<SeriesBrief>,
 }
 
 #[tauri::command]
@@ -526,94 +559,6 @@ pub(crate) fn export_frame_from_pixels(
     Ok(output.to_string())
 }
 
-// 批量导出：把任意受支持文件解码为单帧后，按各自默认窗设置导出。
-pub(crate) fn decode_any_to_frame(path: &str) -> Result<DicomImage, String> {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
-        decode_dicom_file(path)
-    } else if lower.ends_with(".nii") || lower.ends_with(".nii.gz") {
-        let vol = decode_nifti(path)?;
-        let [nx, ny, nz] = vol.meta.dims;
-        let z = nz / 2; // 取中间轴向切片
-        let vox: Vec<f32> = vol
-            .voxel_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let mut frame = Vec::with_capacity((nx * ny) as usize);
-        for y in 0..ny as usize {
-            for x in 0..nx as usize {
-                frame.push(vox[((x * ny as usize) + y) * nz as usize + z as usize]);
-            }
-        }
-        let mut pixel_bytes = Vec::with_capacity(frame.len() * 4);
-        for v in &frame {
-            pixel_bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        Ok(DicomImage {
-            meta: DicomMeta {
-                path: path.to_string(),
-                filename: vol.meta.filename,
-                width: nx,
-                height: ny,
-                frames: 1,
-                bits_stored: 16,
-                pixel_representation: if vol.meta.hu_min < 0.0 { 1 } else { 0 },
-                slope: 1.0,
-                intercept: 0.0,
-                window_center: ((vol.meta.hu_min + vol.meta.hu_max) / 2.0) as f64,
-                window_width: (vol.meta.hu_max - vol.meta.hu_min) as f64,
-                photometric: "MONOCHROME2".to_string(),
-                hu_min: vol.meta.hu_min,
-                hu_max: vol.meta.hu_max,
-            },
-            pixel_bytes,
-        })
-    } else if lower.ends_with(".j2c") || lower.ends_with(".jph") {
-        let bytes = std::fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
-        decode_htj2k(&bytes)
-    } else {
-        decode_regular_image(path)
-    }
-}
-
-fn try_export_one(
-    path: &str,
-    format: &str,
-    quality: u8,
-    out_dir: &str,
-) -> Result<(), String> {
-    let img = decode_any_to_frame(path)?;
-    let n = (img.meta.width * img.meta.height) as usize;
-    let hu: Vec<f32> = img
-        .pixel_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let wc = img.meta.window_center;
-    let ww = img.meta.window_width;
-    let stem = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("image");
-    let ext = match format.to_lowercase().as_str() {
-        "png" => "png",
-        "jpeg" | "jpg" => "jpg",
-        "htj2k" | "j2c" | "jph" => "jph",
-        _ => "png",
-    };
-    let out = Path::new(out_dir).join(format!(
-        "{}_{}_wc{}_ww{}.{}",
-        stem,
-        format,
-        wc.round(),
-        ww.round(),
-        ext
-    ));
-    export_frame_from_pixels(&hu[0..n], img.meta.width, img.meta.height, &img.meta.photometric, wc, ww, format, quality, &out.to_string_lossy())
-        .map(|_| ())
-}
-
 // ---------- Tauri commands ----------
 
 #[tauri::command]
@@ -667,28 +612,6 @@ fn export_frame(
     )
 }
 
-#[tauri::command]
-fn batch_export(
-    paths: Vec<String>,
-    format: String,
-    quality: u8,
-    out_dir: String,
-) -> Result<BatchResult, String> {
-    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建输出目录失败: {}", e))?;
-    let mut ok = 0usize;
-    let mut failed = Vec::new();
-    for p in &paths {
-        match try_export_one(p, &format, quality, &out_dir) {
-            Ok(()) => ok += 1,
-            Err(e) => failed.push(BatchFail {
-                path: p.clone(),
-                error: e,
-            }),
-        }
-    }
-    Ok(BatchResult { ok, failed })
-}
-
 // ---------- 文件标签（详情对话框） ----------
 
 fn fname(path: &str) -> String {
@@ -697,6 +620,151 @@ fn fname(path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string()
+}
+
+// VR 中文含义，用于标签说明（标准字典无标签名称字段时的降级说明）
+fn vr_meaning(vr: &str) -> &'static str {
+    match vr {
+        "PN" => "人名",
+        "LO" => "长字符串",
+        "SH" => "短字符串",
+        "CS" => "短字符串/代码",
+        "DS" => "十进制字符串",
+        "IS" => "整数字符串",
+        "UI" => "唯一标识符(UID)",
+        "DA" => "日期",
+        "TM" => "时间",
+        "DT" => "日期时间",
+        "OB" | "OW" | "OV" => "其他字节/字",
+        "US" => "无符号短整型",
+        "SS" => "有符号短整型",
+        "UL" => "无符号长整型",
+        "SL" => "有符号长整型",
+        "FL" => "浮点(单精度)",
+        "FD" => "浮点(双精度)",
+        "SQ" => "序列(嵌套数据集)",
+        "UN" => "未知",
+        "AT" => "属性标签",
+        "LT" => "长文本",
+        "ST" => "短文本",
+        "UT" => "无限制文本",
+        "UR" => "URI",
+        _ => "值表示",
+    }
+}
+
+// 常见 DICOM 标签的中文释义（参考 dicom.innolitics.com 的标签说明风格：定义 + 常见取值）。
+// 标准字典不提供标签名称字段，这里以关键字 curated 一份高频标签释义表，供详情对话框「?」悬停说明。
+fn tag_explanation(keyword: &str) -> Option<&'static str> {
+    let s = match keyword {
+        "PatientName" => "患者姓名。格式通常为「姓^名」（DICOM Person Name），如 “Zhang^San”。",
+        "PatientID" => "患者唯一标识（医疗机构内部 ID）。常见值：数字或字母数字串。",
+        "PatientBirthDate" => "患者出生日期。类型 DA，格式 YYYYMMDD。",
+        "PatientSex" => "患者性别（枚举）。常见值：M（男）/ F（女）/ O（其他）。",
+        "PatientAge" => "患者年龄。格式为「nnnY/W/D」，如 “045Y” 表示 45 岁。",
+        "PatientWeight" => "患者体重（单位 kg）。",
+        "PatientSize" => "患者身高或体长（单位 m）。",
+        "ReferringPhysicianName" => "转诊医师姓名（Person Name 格式）。",
+        "OperatorsName" => "操作技师姓名（多人用反斜杠分隔）。",
+        "StudyDate" => "检查（Study）日期。类型 DA，格式 YYYYMMDD。",
+        "StudyTime" => "检查时间。类型 TM，格式 HHMMSS.FFFFFF。",
+        "SeriesDate" => "序列（Series）获取日期。类型 DA。",
+        "SeriesTime" => "序列获取时间。类型 TM。",
+        "AcquisitionDate" => "数据采集日期。类型 DA。",
+        "AcquisitionTime" => "数据采集时间。类型 TM。",
+        "ContentDate" => "内容创建日期。类型 DA。",
+        "ContentTime" => "内容创建时间。类型 TM。",
+        "StudyInstanceUID" => "检查的唯一标识符（UID）。同一次检查下的所有序列共享同一 StudyInstanceUID。",
+        "SeriesInstanceUID" => "序列的唯一标识符（UID）。同一序列的所有切片/帧共享此值，用于区分不同序列。",
+        "SOPInstanceUID" => "SOP 实例 UID，单个图像/对象的全局唯一标识。",
+        "SOPClassUID" => "SOP 类 UID，标识对象类型（如 CT Image Storage、RT Structure Set）。",
+        "StudyDescription" => "检查描述（自由文本）。常见值：“CT HEAD”、“CBCT” 等。",
+        "SeriesDescription" => "序列描述（自由文本）。常见值：“Axial T2”、“骨窗重建” 等。",
+        "Modality" => "设备类型/模态（枚举）。常见值：CT、MR、US、CR、DX、PT、RTSTRUCT、RTPLAN 等。",
+        "Manufacturer" => "设备厂商。常见值：SIEMENS、GE、Philips、Varian、TOSHIBA 等。",
+        "ManufacturerModelName" => "设备型号名称（如 “SOMATOM Force”）。",
+        "DeviceSerialNumber" => "设备序列号。",
+        "SoftwareVersions" => "设备软件版本。",
+        "StationName" => "设备工作站名称/编号。",
+        "InstitutionName" => "检查机构/医院名称。",
+        "InstitutionAddress" => "检查机构地址。",
+        "AccessionNumber" => "检查登记号（医院放射科流程号）。",
+        "StudyID" => "检查 ID（流程编号，与 AccessionNumber 常对应）。",
+        "SeriesNumber" => "序列编号，用于同一检查内区分多个序列。",
+        "InstanceNumber" => "实例号，常用于同一序列内对切片/帧进行排序编号。",
+        "BodyPartExamined" => "检查部位（枚举）。常见值：HEAD、CHEST、ABDOMEN、PELVIS 等。",
+        "Laterality" => "左右侧（枚举）。常见值：L（左）/ R（右）。",
+        "ImageLaterality" => "图像所代表的左右侧（枚举）。常见值：L / R。",
+        "PatientPosition" => "患者体位（枚举）。常见值：HFS（头在前仰卧）、FFS、HFDR、FFDL 等。",
+        "ViewPosition" => "投照体位（如 X 线正侧位）。常见值：AP、PA、LAT、RLO 等。",
+        "SliceThickness" => "层厚（单位 mm）。常见值：0.5、1.0、2.0、5.0 等。",
+        "SpacingBetweenSlices" => "相邻切片中心之间的间距（单位 mm）。",
+        "SliceLocation" => "切片位置（沿扫描平面的物理距离，单位 mm），常用于排序。",
+        "ImagePositionPatient" => "图像原点在患者坐标系（LPS）中的位置 (x,y,z)，单位 mm。用于序列空间排序。",
+        "ImageOrientationPatient" => "图像平面方向余弦（行方向 3 值 + 列方向 3 值，共 6 值），定义图像在患者空间中的朝向。",
+        "PixelSpacing" => "像素间距（行距, 列距），单位 mm。决定图像的物理尺寸。",
+        "RowSpacing" | "ColumnSpacing" => "行/列方向的像素间距（单位 mm）。",
+        "PixelAspectRatio" => r"像素宽高比（两整数比，如 1\1）。",
+        "Rows" => "图像行数（即高度，单位像素）。",
+        "Columns" => "图像列数（即宽度，单位像素）。",
+        "BitsAllocated" => "每个像素样本分配的位数。常见值：8、16。",
+        "BitsStored" => "每个像素样本实际存储的位数（≤ BitsAllocated）。",
+        "HighBit" => "像素值中最高有效位的位索引（BitsStored-1）。",
+        "PixelRepresentation" => "像素值的数据类型（枚举）。0=无符号整数；1=有符号整数（可表示负 HU 值）。",
+        "SamplesPerPixel" => "每像素的样本数。1=灰度（单通道）；3=RGB（彩色）。",
+        "PhotometricInterpretation" => "光度解释（枚举）。常见值：MONOCHROME1/2（灰度，1 为反相黑白）、RGB、YBR_FULL、PALETTE COLOR。",
+        "PlanarConfiguration" => "彩色像素的存储方式（枚举）。0=按像素交错；1=按通道平面存储。",
+        "NumberOfFrames" => "图像中的帧数（多帧图像，如定位像、动态序列、电影循环）。1 表示单帧。",
+        "ImageType" => "图像类型（多值，反斜杠分隔）。常见值：如 “DERIVED\\SECONDARY\\AXIAL” 或 “ORIGINAL\\PRIMARY”。",
+        "AcquisitionNumber" => "采集编号，同一次连续采集内的图像该值相同。",
+        "ScanOptions" => "扫描选项（如螺旋扫描 “SPIRAL”、序列 “SEQ”）。",
+        "ReconstructionDiameter" => "重建视野直径（单位 mm）。",
+        "DistanceSourceToDetector" => "射线源到探测器的距离（单位 mm，CT 几何）。",
+        "DistanceSourceToPatient" => "射线源到患者（等中心）的距离（单位 mm）。",
+        "GantryDetectorTilt" => "机架/探测器倾角（单位 °）。",
+        "TableHeight" => "检查床高度（单位 mm）。",
+        "RotationDirection" => "机架旋转方向（枚举）。常见值：CW（顺时针）/ CC（逆时针）。",
+        "ExposureTime" => "曝光时间（单位 ms）。",
+        "XRayTubeCurrent" => "X 线管电流（单位 mA）。",
+        "Exposure" => "曝光量（单位 mAs）。",
+        "ExposureInuAs" => "曝光量（单位 μAs）。",
+        "KVP" => "管电压（单位 kV），CT/X 线相关。",
+        "GeneratorPower" => "发生器功率（单位 W）。",
+        "FocalSpot" => "焦点尺寸（单位 mm）。",
+        "FilterType" => "滤线器类型。",
+        "ConvolutionKernel" => "重建卷积核（枚举）。常见值：“B30s”、“B70s”、“STANDARD”、“H70s” 等。",
+        "RescaleIntercept" => "像素值→真实值（常 HU）的截距 b：real = slope×stored + intercept。常见值：-1024。",
+        "RescaleSlope" => "像素值→真实值的斜率 m。常见值：1。",
+        "RescaleType" => "刻度类型。常见值：HU（Hounsfield Unit，豪斯菲尔德单位）。",
+        "WindowCenter" => "窗位（窗中心值，常为 HU），用于窗映射显示。可为多值（反斜杠分隔）。",
+        "WindowWidth" => "窗宽（窗范围），用于窗映射显示。可为多值（反斜杠分隔）。",
+        "WindowCenterWidthExplanation" => "窗位/窗宽对应的含义说明（如 “脑窗”、“骨窗”）。",
+        "LossyImageCompression" => "是否经过有损压缩（枚举）。常见值：00（无损）/ 01（有损）。",
+        "LossyImageCompressionRatio" => "有损压缩比（如 10 表示压缩 10 倍）。",
+        "TransferSyntaxUID" => "传输语法 UID，决定字节序与压缩方式（如显式 VR 小端、JPEG2000、RLE）。",
+        "SpecificCharacterSet" => "字符集，决定文本编码（如 ISO_IR 100=Latin1、ISO_IR 192=UTF-8、GB18030）。",
+        "PixelData" => "像素数据（原始图像字节）。体积较大，界面中已省略显示。",
+        "EchoTime" => "回波时间 TE（单位 ms），MR 相关。",
+        "RepetitionTime" => "重复时间 TR（单位 ms），MR 相关。",
+        "InversionTime" => "反转时间 TI（单位 ms），MR 相关。",
+        "EchoTrainLength" => "回波链长度（ETL），MR 快速自旋回波相关。",
+        "FlipAngle" => "翻转角（单位 °），MR 梯度回波相关。",
+        "MagneticFieldStrength" => "主磁场强度（单位 T），MR 相关。常见值：1.5、3.0。",
+        "ImagingFrequency" => "成像频率（单位 MHz），MR 相关。",
+        "SequenceName" => "脉冲序列名称。",
+        "PixelBandwidth" => "像素带宽（单位 Hz/像素），MR 相关。",
+        "SecondaryCaptureDeviceManufacturer" => "二次采集设备厂商（屏幕截图/导入类图像）。",
+        "PresentationLUTShape" => "显示 LUT 形状（枚举）。常见值：IDENTITY（线性保持不变）。",
+        "RequestingPhysician" => "申请检查的医师姓名。",
+        "RequestingService" => "申请检查的科室/服务。",
+        "RequestedProcedureDescription" => "申请的检查项目名称。",
+        "ScheduledProcedureStepDescription" => "计划执行的操作步骤描述。",
+        "ImageComments" => "图像注释自由文本。",
+        "IssueDateOfFilm" => "胶片制作日期。",
+        "InterpretationAuthor" => "报告/注解作者。",
+        _ => return None,
+    };
+    Some(s)
 }
 
 fn image_format_label(lower: &str) -> &'static str {
@@ -726,15 +794,20 @@ fn dicom_tags(path: &str) -> Result<FileTags, String> {
         } else {
             elem.to_str().unwrap_or_default().to_string()
         };
-        let keyword = dicom_dictionary_std::StandardDataDictionary
-            .by_tag(tag)
-            .map(|e| e.alias.to_string())
-            .unwrap_or_default();
+        let vr = format!("{}", elem.vr());
+        let entry = dicom_dictionary_std::StandardDataDictionary.by_tag(tag);
+        let keyword = entry.map(|e| e.alias.to_string()).unwrap_or_default();
+        // 悬停说明：优先用常见标签的「含义解释 + 常见值」，其余回退到 VR 含义
+        let description = match tag_explanation(&keyword) {
+            Some(s) => s.to_string(),
+            None => format!("VR {}（{}）", vr, vr_meaning(&vr)),
+        };
         rows.push(TagRow {
             tag: format!("({:04X},{:04X})", tag.group(), tag.element()),
-            vr: format!("{}", elem.vr()),
+            vr,
             keyword,
             value,
+            description,
         });
     }
     Ok(FileTags {
@@ -758,6 +831,7 @@ fn nifti_tags(path: &str) -> Result<FileTags, String> {
             vr: "-".into(),
             keyword: keyword.into(),
             value,
+            description: String::new(),
         });
     };
     push(&mut rows, "sizeof_hdr", "HeaderSize", h.sizeof_hdr.to_string());
@@ -794,30 +868,35 @@ fn image_tags(path: &str, format_label: &str) -> Result<FileTags, String> {
         vr: "-".into(),
         keyword: "Format".into(),
         value: format_label.into(),
+        description: String::new(),
     });
     rows.push(TagRow {
         tag: "width".into(),
         vr: "-".into(),
         keyword: "Width".into(),
         value: w.to_string(),
+        description: String::new(),
     });
     rows.push(TagRow {
         tag: "height".into(),
         vr: "-".into(),
         keyword: "Height".into(),
         value: h.to_string(),
+        description: String::new(),
     });
     rows.push(TagRow {
         tag: "colorType".into(),
         vr: "-".into(),
         keyword: "ColorType".into(),
         value: format!("{:?}", color),
+        description: String::new(),
     });
     rows.push(TagRow {
         tag: "bitsPerPixel".into(),
         vr: "-".into(),
         keyword: "BitsPerPixel".into(),
         value: color.bits_per_pixel().to_string(),
+        description: String::new(),
     });
     if let Ok(meta) = std::fs::metadata(path) {
         rows.push(TagRow {
@@ -825,6 +904,7 @@ fn image_tags(path: &str, format_label: &str) -> Result<FileTags, String> {
             vr: "-".into(),
             keyword: "FileSize".into(),
             value: format!("{} bytes", meta.len()),
+            description: String::new(),
         });
     }
     Ok(FileTags {
@@ -851,30 +931,35 @@ fn file_tags(path: String) -> Result<FileTags, String> {
                 vr: "-".into(),
                 keyword: "Format".into(),
                 value: "HTJ2K".into(),
+                description: String::new(),
             },
             TagRow {
                 tag: "width".into(),
                 vr: "-".into(),
                 keyword: "Width".into(),
                 value: img.meta.width.to_string(),
+                description: String::new(),
             },
             TagRow {
                 tag: "height".into(),
                 vr: "-".into(),
                 keyword: "Height".into(),
                 value: img.meta.height.to_string(),
+                description: String::new(),
             },
             TagRow {
                 tag: "frames".into(),
                 vr: "-".into(),
                 keyword: "Frames".into(),
                 value: img.meta.frames.to_string(),
+                description: String::new(),
             },
             TagRow {
                 tag: "photometric".into(),
                 vr: "-".into(),
                 keyword: "Photometric".into(),
                 value: img.meta.photometric.clone(),
+                description: String::new(),
             },
         ];
         if let Ok(meta) = std::fs::metadata(&path) {
@@ -883,6 +968,7 @@ fn file_tags(path: String) -> Result<FileTags, String> {
                 vr: "-".into(),
                 keyword: "FileSize".into(),
                 value: format!("{} bytes", meta.len()),
+                description: String::new(),
             });
         }
         Ok(FileTags {
@@ -892,6 +978,88 @@ fn file_tags(path: String) -> Result<FileTags, String> {
         })
     } else {
         image_tags(&path, image_format_label(&lower))
+    }
+}
+
+// 单文件打开时读取系列与位置字段（不解码像素），供前端做系列分组/排序/切换
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SeriesFields {
+    series_uid: Option<String>,
+    series_number: Option<u32>,
+    modality: Option<String>,
+    instance_number: Option<u32>,
+    slice_location: Option<f64>,
+    image_pos_patient: Option<Vec<f64>>,
+    image_orientation: Option<Vec<f64>>,
+}
+
+#[tauri::command]
+fn file_series_info(path: String) -> Result<SeriesFields, String> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
+        let obj = dicom_object::open_file(&path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+        let (series_uid, series_number, modality, instance_number, slice_location, image_pos_patient, image_orientation) =
+            read_dicom_series(&*obj);
+        Ok(SeriesFields {
+            series_uid,
+            series_number,
+            modality,
+            instance_number,
+            slice_location,
+            image_pos_patient,
+            image_orientation,
+        })
+    } else {
+        Ok(SeriesFields {
+            series_uid: None,
+            series_number: None,
+            modality: None,
+            instance_number: None,
+            slice_location: None,
+            image_pos_patient: None,
+            image_orientation: None,
+        })
+    }
+}
+
+// 标签信息导出：根据格式生成 JSON / CSV 并写入用户指定路径
+#[tauri::command]
+fn export_tags(path: String, format: String, rows: Vec<TagRow>) -> Result<String, String> {
+    let content = if format.eq_ignore_ascii_case("csv") {
+        tags_to_csv(&rows)
+    } else {
+        serde_json::to_string_pretty(&rows).map_err(|e| format!("序列化 JSON 失败: {}", e))?
+    };
+    std::fs::write(&path, content).map_err(|e| format!("写入文件失败: {}", e))?;
+    Ok(path)
+}
+
+fn tags_to_csv(rows: &[TagRow]) -> String {
+    let mut s = String::from("Tag,VR,Keyword,Value,Description\n");
+    for r in rows {
+        s.push_str(&csv_field(&r.tag));
+        s.push(',');
+        s.push_str(&csv_field(&r.vr));
+        s.push(',');
+        s.push_str(&csv_field(&r.keyword));
+        s.push(',');
+        s.push_str(&csv_field(&r.value));
+        s.push(',');
+        s.push_str(&csv_field(&r.description));
+        s.push('\n');
+    }
+    s
+}
+
+fn csv_field(v: &str) -> String {
+    if v.contains(',') || v.contains('"') || v.contains('\n') {
+        let mut s = String::from("\"");
+        s.push_str(&v.replace('"', "\"\""));
+        s.push('"');
+        s
+    } else {
+        v.to_string()
     }
 }
 
@@ -906,19 +1074,7 @@ fn list_folder_images(dir: String) -> Result<Vec<ImageInfo>, String> {
             continue;
         }
         let path = p.to_string_lossy().to_string();
-        let lower = path.to_lowercase();
-        let kind = if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
-            "dicom"
-        } else if lower.ends_with(".j2c") || lower.ends_with(".jph") {
-            "htj2k"
-        } else if lower.ends_with(".png")
-            || lower.ends_with(".jpg")
-            || lower.ends_with(".jpeg")
-            || lower.ends_with(".tif")
-            || lower.ends_with(".tiff")
-        {
-            "image"
-        } else {
+        let Some(kind) = classify_image_kind(&path) else {
             continue; // 跳过不支持/非影像
         };
         // 单文件失败不影响整体，跳过即可
@@ -926,8 +1082,7 @@ fn list_folder_images(dir: String) -> Result<Vec<ImageInfo>, String> {
             out.push(info);
         }
     }
-    out.sort_by(|a, b| a.filename.cmp(&b.filename));
-    Ok(out)
+    Ok(group_and_sort_series(out))
 }
 
 fn folder_image_info(path: &str, kind: &str) -> Result<ImageInfo, String> {
@@ -936,40 +1091,411 @@ fn folder_image_info(path: &str, kind: &str) -> Result<ImageInfo, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown")
         .to_string();
+    // 系列与位置字段（仅 DICOM 有值，其它类型均为 None）
+    let (series_uid, series_number, modality, instance_number, slice_location, image_pos_patient, image_orientation) =
+        if kind == "dicom" {
+            let obj =
+                dicom_object::open_file(path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+            read_dicom_series(&*obj)
+        } else {
+            (None, None, None, None, None, None, None)
+        };
+    let base = |w: u32, h: u32, frames: u32| ImageInfo {
+        path: path.to_string(),
+        filename: filename.clone(),
+        width: w,
+        height: h,
+        frames,
+        kind: kind.into(),
+        series_uid: series_uid.clone(),
+        series_number,
+        modality: modality.clone(),
+        instance_number,
+        slice_location,
+        image_pos_patient: image_pos_patient.clone(),
+        image_orientation: image_orientation.clone(),
+        series_group: None,
+        series_label: None,
+    };
     if kind == "dicom" {
         let obj = dicom_object::open_file(path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
         let (w, h, frames) = read_dicom_dims(&*obj)?;
-        Ok(ImageInfo {
-            path: path.to_string(),
-            filename,
-            width: w,
-            height: h,
-            frames,
-            kind: kind.into(),
-        })
+        Ok(base(w, h, frames))
     } else if kind == "htj2k" {
         let bytes = std::fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
         let img = decode_htj2k(&bytes)?;
-        Ok(ImageInfo {
-            path: path.to_string(),
-            filename,
-            width: img.meta.width,
-            height: img.meta.height,
-            frames: img.meta.frames,
-            kind: kind.into(),
-        })
+        Ok(base(img.meta.width, img.meta.height, img.meta.frames))
     } else {
         let img = image::open(path).map_err(|e| format!("打开图像失败: {}", e))?;
         let (w, h) = img.dimensions();
-        Ok(ImageInfo {
-            path: path.to_string(),
-            filename,
-            width: w,
-            height: h,
-            frames: 1,
-            kind: kind.into(),
-        })
+        Ok(base(w, h, 1))
     }
+}
+
+// 递归收集目录下所有文件（含子目录）
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.filter_map(|e| e.ok()) {
+            let p = ent.path();
+            if p.is_dir() {
+                collect_files(&p, out);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+}
+
+// 文件夹导入支持的类型判定（NIfTI 暂不支持文件夹导入，仍用「打开文件」）
+fn classify_image_kind(path: &str) -> Option<&'static str> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
+        Some("dicom")
+    } else if lower.ends_with(".j2c") || lower.ends_with(".jph") {
+        Some("htj2k")
+    } else if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".tif")
+        || lower.ends_with(".tiff")
+    {
+        Some("image")
+    } else {
+        None
+    }
+}
+
+// 取 DICOM 文本元素（已 trim），便于聚合 Study/Series 元信息
+fn elem_str(obj: &InMemDicomObject, name: &str) -> Option<String> {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.trim().to_string())
+}
+
+// 递归扫描文件夹，按 StudyInstanceUID → SeriesInstanceUID 两级聚合；非 DICOM 归入 others
+#[tauri::command]
+fn scan_folder_series(dir: String) -> Result<SeriesTree, String> {
+    let root = Path::new(&dir);
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(root, &mut files);
+
+    // key = (study_uid, series_uid)
+    let mut series_paths: std::collections::HashMap<
+        (Option<String>, Option<String>),
+        Vec<String>,
+    > = std::collections::HashMap::new();
+    let mut study_meta: std::collections::HashMap<
+        Option<String>,
+        (Option<String>, Option<String>, Option<String>),
+    > = std::collections::HashMap::new();
+    let mut series_meta: std::collections::HashMap<
+        (Option<String>, Option<String>),
+        (Option<String>, Option<u32>, Option<String>, Option<String>, Option<String>),
+    > = std::collections::HashMap::new();
+    let mut others: Vec<String> = Vec::new();
+
+    for p in &files {
+        let path = p.to_string_lossy().to_string();
+        let Some(kind) = classify_image_kind(&path) else {
+            continue;
+        };
+        if kind != "dicom" {
+            others.push(path);
+            continue;
+        }
+        let obj = match dicom_object::open_file(&path) {
+            Ok(o) => o,
+            Err(_) => {
+                others.push(path);
+                continue;
+            }
+        };
+        let study_uid = elem_str(&obj, "StudyInstanceUID");
+        let series_uid = elem_str(&obj, "SeriesInstanceUID");
+        let patient_name = elem_str(&obj, "PatientName");
+        let patient_id = elem_str(&obj, "PatientID");
+        let study_date = elem_str(&obj, "StudyDate");
+        let series_date = elem_str(&obj, "SeriesDate").or_else(|| elem_str(&obj, "StudyDate"));
+        let modality = elem_str(&obj, "Modality");
+        let series_number = attr_u32_opt(&obj, "SeriesNumber");
+        let series_description = elem_str(&obj, "SeriesDescription");
+        let key = (study_uid.clone(), series_uid.clone());
+        series_paths.entry(key.clone()).or_default().push(path);
+        study_meta
+            .entry(study_uid.clone())
+            .or_insert((patient_name.clone(), patient_id.clone(), study_date.clone()));
+        series_meta.entry(key).or_insert((
+            modality,
+            series_number,
+            series_description,
+            series_date,
+            patient_name,
+        ));
+    }
+
+    let mut study_map: std::collections::HashMap<Option<String>, Vec<SeriesBrief>> =
+        std::collections::HashMap::new();
+    for ((study_uid, series_uid), paths) in series_paths {
+        let (modality, series_number, series_description, series_date, patient_name) = series_meta
+            .get(&(study_uid.clone(), series_uid.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let brief = SeriesBrief {
+            study_uid: study_uid.clone(),
+            series_uid: series_uid.clone(),
+            modality,
+            series_number,
+            series_description,
+            patient_name,
+            patient_id: study_meta.get(&study_uid).and_then(|m| m.1.clone()),
+            series_date,
+            study_date: study_meta.get(&study_uid).and_then(|m| m.2.clone()),
+            file_count: paths.len(),
+            paths,
+        };
+        study_map.entry(study_uid).or_default().push(brief);
+    }
+
+    let mut studies: Vec<StudyBrief> = study_map
+        .into_iter()
+        .map(|(study_uid, mut series)| {
+            series.sort_by_key(|s| s.series_number.unwrap_or(u32::MAX));
+            let meta = study_meta.get(&study_uid);
+            StudyBrief {
+                study_uid,
+                patient_name: meta.and_then(|m| m.0.clone()),
+                patient_id: meta.and_then(|m| m.1.clone()),
+                study_date: meta.and_then(|m| m.2.clone()),
+                series,
+            }
+        })
+        .collect();
+    studies.sort_by_key(|s| s.study_uid.clone().unwrap_or_default());
+
+    let others_brief = if others.is_empty() {
+        None
+    } else {
+        Some(SeriesBrief {
+            study_uid: None,
+            series_uid: None,
+            modality: None,
+            series_number: None,
+            series_description: Some("其他影像文件".into()),
+            patient_name: None,
+            patient_id: None,
+            series_date: None,
+            study_date: None,
+            file_count: others.len(),
+            paths: others,
+        })
+    };
+
+    Ok(SeriesTree {
+        studies,
+        others: others_brief,
+    })
+}
+
+// 加载指定序列的文件路径列表：构建 ImageInfo 并按系列分组排序（仅所选序列进入视图）
+#[tauri::command]
+fn load_series_files(paths: Vec<String>) -> Result<Vec<ImageInfo>, String> {
+    let mut infos: Vec<ImageInfo> = Vec::new();
+    for p in &paths {
+        if let Some(kind) = classify_image_kind(p) {
+            if let Ok(info) = folder_image_info(p, kind) {
+                infos.push(info);
+            }
+        }
+    }
+    if infos.is_empty() {
+        return Err("所选序列未找到可识别的影像文件".into());
+    }
+    let mut sorted = group_and_sort_series(infos);
+    // 非 DICOM（others）序列无 series_uid，统一打标签便于状态栏分组显示
+    if sorted[0].series_uid.is_none() {
+        for it in &mut sorted {
+            it.series_group = Some(0);
+            it.series_label = Some("其他影像文件".into());
+        }
+    }
+    Ok(sorted)
+}
+
+// 读取 DICOM 的系列与位置字段（不解码像素），用于按系列分组、位置排序、系列内切换
+fn read_dicom_series(
+    obj: &InMemDicomObject,
+) -> (
+    Option<String>,
+    Option<u32>,
+    Option<String>,
+    Option<u32>,
+    Option<f64>,
+    Option<Vec<f64>>,
+    Option<Vec<f64>>,
+) {
+    let series_uid = obj
+        .element_by_name("SeriesInstanceUID")
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let series_number = attr_u32_opt(obj, "SeriesNumber");
+    let modality = obj
+        .element_by_name("Modality")
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.trim().to_string());
+    let instance_number = attr_u32_opt(obj, "InstanceNumber");
+    let slice_location = elem_f64_first(obj, "SliceLocation");
+    let image_pos_patient = elem_vec_f64(obj, "ImagePositionPatient");
+    let image_orientation = elem_vec_f64(obj, "ImageOrientationPatient");
+    (series_uid, series_number, modality, instance_number, slice_location, image_pos_patient, image_orientation)
+}
+
+fn attr_u32_opt(obj: &InMemDicomObject, name: &str) -> Option<u32> {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .and_then(|s| s.trim().split('\\').next().and_then(|v| v.parse::<u32>().ok()))
+}
+
+fn elem_f64_first(obj: &InMemDicomObject, name: &str) -> Option<f64> {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .and_then(|s| s.trim().split('\\').next().and_then(|v| v.parse::<f64>().ok()))
+}
+
+fn elem_vec_f64(obj: &InMemDicomObject, name: &str) -> Option<Vec<f64>> {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.split('\\').filter_map(|v| v.trim().parse::<f64>().ok()).collect())
+}
+
+// 三个分量叉积
+fn cross3(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+// 归一化
+fn normalize3(v: &[f64; 3]) -> [f64; 3] {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if n == 0.0 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+}
+// 同系列内的排序键：优先 ImagePositionPatient 沿法向量投影；其次 InstanceNumber；再次 SliceLocation
+fn series_sort_key(
+    ipp: &Option<Vec<f64>>,
+    normal: &Option<[f64; 3]>,
+    instance: Option<u32>,
+    slice: Option<f64>,
+) -> f64 {
+    if let (Some(pos), Some(n)) = (ipp, normal) {
+        if pos.len() == 3 {
+            return pos[0] * n[0] + pos[1] * n[1] + pos[2] * n[2];
+        }
+    }
+    if let Some(i) = instance {
+        return i as f64;
+    }
+    if let Some(s) = slice {
+        return s;
+    }
+    0.0
+}
+
+// 按 SeriesInstanceUID 分组、组内按位置排序、组间稳定排序；结果带 series_group / series_label
+fn group_and_sort_series(items: Vec<ImageInfo>) -> Vec<ImageInfo> {
+    use std::collections::HashMap;
+    if items.is_empty() {
+        return items;
+    }
+    let mut groups: HashMap<Option<String>, Vec<usize>> = HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        groups.entry(it.series_uid.clone()).or_default().push(i);
+    }
+    // 组间顺序：有系列按 (SeriesNumber, Modality, 文件名)，无系列(None) 放最后并按文件名
+    let mut group_keys: Vec<Option<String>> = groups.keys().cloned().collect();
+    group_keys.sort_by(|a, b| {
+        let rep = |k: &Option<String>| -> (u64, String, String) {
+            match k {
+                None => (u64::MAX, "\u{ffff}".to_string(), "\u{ffff}".to_string()),
+                Some(_uid) => {
+                    let first = &items[*groups.get(k).unwrap().first().unwrap()];
+                    let sno = first.series_number.unwrap_or(u32::MAX) as u64;
+                    (sno, first.modality.clone().unwrap_or_default(), first.filename.clone())
+                }
+            }
+        };
+        let (sa, ma, fa) = rep(a);
+        let (sb, mb, fb) = rep(b);
+        sa.cmp(&sb).then(ma.cmp(&mb)).then(fa.cmp(&fb))
+    });
+    let mut result: Vec<ImageInfo> = Vec::with_capacity(items.len());
+    let mut group_no: u32 = 0;
+    for key in group_keys {
+        let idxs = &groups[&key];
+        // 系列法向量：取组内第一个同时具备 IOP(6) 与 IPP(3) 的文件
+        let normal: Option<[f64; 3]> = idxs.iter().find_map(|&i| {
+            let it = &items[i];
+            match (&it.image_orientation, &it.image_pos_patient) {
+                (Some(o), Some(p)) if o.len() == 6 && p.len() == 3 => {
+                    Some(normalize3(&cross3(&[o[0], o[1], o[2]], &[o[3], o[4], o[5]])))
+                }
+                _ => None,
+            }
+        });
+        let mut order: Vec<usize> = idxs.clone();
+        order.sort_by(|&a, &b| {
+            let ka = series_sort_key(
+                &items[a].image_pos_patient,
+                &normal,
+                items[a].instance_number,
+                items[a].slice_location,
+            );
+            let kb = series_sort_key(
+                &items[b].image_pos_patient,
+                &normal,
+                items[b].instance_number,
+                items[b].slice_location,
+            );
+            ka.partial_cmp(&kb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(items[a].filename.cmp(&items[b].filename))
+        });
+        let is_series = key.is_some();
+        let label = if is_series {
+            let first = &items[order[0]];
+            let modality = first.modality.clone().unwrap_or_else(|| "Series".to_string());
+            let sno = first
+                .series_number
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let uid = key.as_ref().unwrap();
+            let short = &uid[uid.len().saturating_sub(8)..];
+            format!("{} Series {} · {}", modality, sno, short)
+        } else {
+            String::new()
+        };
+        for &i in &order {
+            let mut it = items[i].clone();
+            if is_series {
+                it.series_group = Some(group_no);
+                it.series_label = Some(label.clone());
+            } else {
+                it.series_group = None;
+                it.series_label = None;
+            }
+            result.push(it);
+        }
+        if is_series {
+            group_no += 1;
+        }
+    }
+    result
 }
 
 fn attr_u32(obj: &InMemDicomObject, name: &str, default: u32) -> u32 {
@@ -1046,8 +1572,13 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
         let infos = list_folder_images(dir.to_string_lossy().to_string()).expect("list_folder_images");
         assert!(infos.len() > 100, "CBCT 文件夹应扫描到大量影像，实际 {}", infos.len());
-        // 排序后首文件应为 0000.dcm
-        assert_eq!(infos[0].filename, "0000.dcm");
+        // 排序后顺序按系列分组+位置排序，首文件名不再固定；验证完整性与无重复导入
+        let unique = infos
+            .iter()
+            .map(|i| &i.filename)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert_eq!(unique, infos.len(), "导入文件应唯一，不应重复");
         let first = &infos[0];
         assert_eq!(first.kind, "dicom");
         assert_eq!(first.width, 390);
@@ -1294,9 +1825,12 @@ pub fn run() {
             load_nifti,
             load_htj2k,
             export_frame,
-            batch_export,
             file_tags,
-            list_folder_images
+            list_folder_images,
+            file_series_info,
+            export_tags,
+            scan_folder_series,
+            load_series_files
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

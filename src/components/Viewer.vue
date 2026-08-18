@@ -8,7 +8,11 @@ import { invoke } from "@tauri-apps/api/core";
 const props = defineProps<{
   meta: DicomMeta;
   frames: Float32Array[]; // 每帧 HU 数组，长度 = width*height
+  // 当前选中文件所属系列的有序文件列表（按位置排序）；长度>1 时画布右侧竖条列出切片便于快速切换
+  seriesFiles?: Array<{ id: number; info: { filename: string } }>;
+  activeId?: number | null;
 }>();
+const emit = defineEmits<{ selectFile: [id: number] }>();
 
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const wc = ref(props.meta.windowCenter);
@@ -16,6 +20,92 @@ const ww = ref(props.meta.windowWidth);
 const frameIndex = ref(0);
 const zoom = ref(1);
 const pan = ref({ x: 0, y: 0 });
+
+// 画布右侧竖向滚动条：位置对应图像序号（多帧帧号 / 同系列切片序号），
+// 滚动 / 拖拽即直接切换对应位置的图像（不渲染序号按钮）
+const scrollRef = ref<HTMLElement | null>(null);
+const trackH = ref(0);
+
+const stripItems = computed(() => {
+  const items: Array<{ type: "frame" | "series"; index?: number; id?: number }> = [];
+  if (props.meta.frames > 1) {
+    for (let f = 0; f < props.meta.frames; f++) {
+      items.push({ type: "frame", index: f });
+    }
+  } else if (props.seriesFiles && props.seriesFiles.length > 1) {
+    props.seriesFiles.forEach((s) => {
+      items.push({ type: "series", id: s.id });
+    });
+  }
+  return items;
+});
+
+// 当前显示的图像在 stripItems 中的序号
+const currentIndex = computed(() => {
+  const items = stripItems.value;
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.type === "frame" && it.index === frameIndex.value) return i;
+    if (it.type === "series" && it.id === props.activeId) return i;
+  }
+  return 0;
+});
+
+// 滚动条→图像序号：滚动/拖拽直接切换，无中间态
+function goToIndex(i: number) {
+  const it = stripItems.value[i];
+  if (!it) return;
+  if (it.type === "frame") frameIndex.value = it.index ?? 0;
+  else if (it.id != null) emit("selectFile", it.id);
+}
+
+// 滑块：高度随图像数缩放，位置对应 currentIndex
+const thumbStyle = computed(() => {
+  const n = stripItems.value.length;
+  const track = trackH.value;
+  if (n <= 1 || track <= 0) return { height: "100%", transform: "translateY(0)" };
+  const minThumb = 28;
+  const thumbH = Math.max(minThumb, Math.floor(track / n));
+  const maxTop = Math.max(1, track - thumbH);
+  const top = (currentIndex.value / (n - 1)) * maxTop;
+  return { height: `${thumbH}px`, transform: `translateY(${top}px)` };
+});
+
+function yToIndex(clientY: number) {
+  const el = scrollRef.value;
+  if (!el) return 0;
+  const rect = el.getBoundingClientRect();
+  const frac = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+  const n = stripItems.value.length;
+  return Math.min(n - 1, Math.round(frac * (n - 1)));
+}
+
+let scrubbing = false;
+function onScrollDown(e: PointerEvent) {
+  if (stripItems.value.length <= 1) return;
+  scrubbing = true;
+  goToIndex(yToIndex(e.clientY));
+  window.addEventListener("pointermove", onScrollMove);
+  window.addEventListener("pointerup", onScrollUp);
+}
+function onScrollMove(e: PointerEvent) {
+  if (!scrubbing) return;
+  goToIndex(yToIndex(e.clientY));
+}
+function onScrollUp() {
+  scrubbing = false;
+  window.removeEventListener("pointermove", onScrollMove);
+  window.removeEventListener("pointerup", onScrollUp);
+}
+function onScrollWheel(e: WheelEvent) {
+  const n = stripItems.value.length;
+  if (n <= 1) return;
+  const dir = e.deltaY > 0 ? 1 : -1;
+  goToIndex(Math.min(n - 1, Math.max(0, currentIndex.value + dir)));
+}
+function measureTrack() {
+  trackH.value = scrollRef.value?.clientHeight ?? 0;
+}
 
 // 复用的 RGBA 缓冲
 let rgba = new Uint8ClampedArray(props.meta.width * props.meta.height * 4);
@@ -53,6 +143,18 @@ function render() {
 
 watch([wc, ww, frameIndex, zoom, pan], render);
 
+// 切换图像（多帧帧号 / 同系列切片）时，校正帧索引并立即在位重绘。
+// 由于 Viewer 常驻不复挂载，必须监听 meta/frames 才能随切片切换刷新画布。
+watch(
+  () => [props.meta, props.frames],
+  () => {
+    if (frameIndex.value > props.meta.frames - 1) {
+      frameIndex.value = Math.max(0, props.meta.frames - 1);
+    }
+    render();
+  }
+);
+
 // 画布自适应：把绘图缓冲同步为容器实际像素尺寸（含 DPR），窗口缩放时自动重绘
 let resizeObserver: ResizeObserver | null = null;
 const fitted = ref(false); // 仅首次加载自动适配一次，之后保留用户缩放
@@ -85,8 +187,10 @@ onMounted(() => {
   resizeCanvas();
   fitToView();
   render();
+  measureTrack();
   resizeObserver = new ResizeObserver(() => {
     resizeCanvas();
+    measureTrack();
     if (!fitted.value) {
       fitToView();
       fitted.value = true;
@@ -99,6 +203,10 @@ onMounted(() => {
 onUnmounted(() => {
   resizeObserver?.disconnect();
   resizeObserver = null;
+  if (scrubbing) {
+    window.removeEventListener("pointermove", onScrollMove);
+    window.removeEventListener("pointerup", onScrollUp);
+  }
 });
 
 // 交互
@@ -206,6 +314,18 @@ async function onExport() {
       <div class="zoom-badge">{{ zoom.toFixed(2) }}x</div>
     </div>
 
+    <!-- 多帧 / 同系列多切片 竖向滚动条：位置对应图像序号，滚动/拖拽即切换（无序号按钮） -->
+    <div
+      class="frame-scroll"
+      ref="scrollRef"
+      v-if="stripItems.length > 1"
+      :title="`${currentIndex + 1} / ${stripItems.length}`"
+      @wheel.prevent="onScrollWheel"
+      @pointerdown="onScrollDown"
+    >
+      <div class="frame-thumb" :style="thumbStyle"></div>
+    </div>
+
     <aside class="side">
       <section class="group">
         <div class="group-title">
@@ -278,6 +398,30 @@ async function onExport() {
   min-width: 0;
   position: relative;
   background: #000;
+}
+.frame-scroll {
+  width: 14px;
+  flex: 0 0 14px;
+  align-self: stretch;
+  position: relative;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.frame-thumb {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  top: 0;
+  border-radius: 6px;
+  background: var(--fg-dim);
+  transition: background 0.12s;
+}
+.frame-scroll:hover .frame-thumb {
+  background: var(--accent);
+}
+.frame-thumb:active {
+  background: var(--accent);
 }
 .canvas {
   width: 100%;

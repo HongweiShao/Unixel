@@ -38,16 +38,6 @@ export interface NiftiVolume {
   voxelBytes: Uint8Array | string | number[];
 }
 
-// 批量导出结果（C2）
-export interface BatchFail {
-  path: string;
-  error: string;
-}
-export interface BatchResult {
-  ok: number;
-  failed: BatchFail[];
-}
-
 // 从文件夹导入：顶层影像文件概要（不含像素，前端懒加载）
 export interface ImageInfo {
   path: string;
@@ -56,6 +46,27 @@ export interface ImageInfo {
   height: number;
   frames: number;
   kind: string; // "dicom" | "image" | "htj2k"
+  // 系列与位置信息（后端已按系列分组、位置排序；非 DICOM 为 null）
+  seriesUid?: string | null;
+  seriesNumber?: number | null;
+  modality?: string | null;
+  instanceNumber?: number | null;
+  sliceLocation?: number | null;
+  imagePosPatient?: number[] | null;
+  imageOrientation?: number[] | null;
+  seriesGroup?: number | null; // 同系列相同；null 表示不属于任何系列
+  seriesLabel?: string | null; // 作为状态栏下拉分组标题
+}
+
+// 单文件打开时后端返回的系列与位置字段（file_series_info）
+export interface SeriesFields {
+  seriesUid?: string | null;
+  seriesNumber?: number | null;
+  modality?: string | null;
+  instanceNumber?: number | null;
+  sliceLocation?: number | null;
+  imagePosPatient?: number[] | null;
+  imageOrientation?: number[] | null;
 }
 
 // 详情对话框：文件标签信息
@@ -64,11 +75,38 @@ export interface TagRow {
   vr: string;
   keyword: string;
   value: string;
+  description: string; // DICOM: 标准字典人类可读名称；其它类型为空
 }
 export interface FileTags {
   kind: string; // "dicom" | "nifti" | "image"
   filename: string;
   rows: TagRow[];
+}
+
+// 文件夹导入：序列选择对话框的数据结构（scan_folder_series 返回）
+export interface SeriesBrief {
+  studyUid?: string | null;
+  seriesUid?: string | null;
+  modality?: string | null;
+  seriesNumber?: number | null;
+  seriesDescription?: string | null;
+  patientName?: string | null;
+  patientId?: string | null;
+  seriesDate?: string | null;
+  studyDate?: string | null;
+  fileCount: number;
+  paths: string[];
+}
+export interface StudyBrief {
+  studyUid?: string | null;
+  patientName?: string | null;
+  patientId?: string | null;
+  studyDate?: string | null;
+  series: SeriesBrief[];
+}
+export interface SeriesTree {
+  studies: StudyBrief[];
+  others?: SeriesBrief | null;
 }
 
 // 将后端返回的像素字节解码为 Float32Array。
