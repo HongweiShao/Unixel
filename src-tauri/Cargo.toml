@@ -1,0 +1,38 @@
+[package]
+name = "unixel"
+version = "0.1.0"
+description = "医学影像查看与处理工具"
+authors = ["Unixel"]
+edition = "2021"
+
+[lib]
+name = "unixel"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+# 医学影像解码：DICOM 对象 / 像素 / 字典
+dicom-object = "0.7"
+dicom-pixeldata = "0.7"
+dicom-dictionary-std = "0.7"
+dicom-core = "0.7"
+# 常规图像与导出
+image = { version = "0.25", features = ["png", "jpeg", "tiff"] }
+# NIfTI 体数据（MPR 基础）
+nifti = { version = "0.11", features = ["ndarray_volumes"] }
+# HTJ2K（纯 Rust 移植 OpenJPH，无 C/C++ FFI）：无损 TS 201 / 有损 TS 203
+openjph-core = "0.1"
+# 文件选择对话框
+tauri-plugin-dialog = "2"
+
+[features]
+default = []
+
+[dev-dependencies]
+ndarray = "0.13"

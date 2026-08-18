@@ -1,0 +1,23 @@
+# ===== 前端依赖（中间产物） =====
+node_modules/
+
+# ===== 前端构建输出（最终产物，由 tauri build / vite build 重新生成） =====
+dist/
+
+# ===== Rust / Tauri 后端构建产物（中间 + 最终产物） =====
+# 默认 Cargo 构建目录
+src-tauri/target/
+# 自定义独立构建目录（规避 Windows Defender 对 .cargo-lock 的锁）
+.cargo-cbct/
+# Tauri 自动生成的代码（schema/types，由 tauri dev/build 重新生成）
+src-tauri/gen/
+
+# ===== 本地工程元数据（不纳入版本库） =====
+.workbuddy/
+
+# ===== 测试数据：保留扫描脚本，忽略原始数据与生成报告 =====
+# 原始 CBCT 数据集（约 116M，390 张 .dcm）
+data/CBCT/
+# 扫描/测试生成的报告（最终产物）
+data/*.json
+# 注意：data/*.py 扫描脚本不在此列，正常纳入版本管理
