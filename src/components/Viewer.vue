@@ -22,7 +22,8 @@ const zoom = ref(1);
 const pan = ref({ x: 0, y: 0 });
 
 // 画布右侧竖向滚动条：位置对应图像序号（多帧帧号 / 同系列切片序号），
-// 滚动 / 拖拽即直接切换对应位置的图像（不渲染序号按钮）
+// 滚动 / 拖拽即直接切换对应位置的图像（不渲染序号按钮）。
+// 方向已反转：滚动条「顶部 = 最后一个切片」、「底部 = 第 0 个切片」。
 const scrollRef = ref<HTMLElement | null>(null);
 const trackH = ref(0);
 
@@ -67,7 +68,8 @@ const thumbStyle = computed(() => {
   const minThumb = 28;
   const thumbH = Math.max(minThumb, Math.floor(track / n));
   const maxTop = Math.max(1, track - thumbH);
-  const top = (currentIndex.value / (n - 1)) * maxTop;
+  // 反转：顶部(top=0) 对应最后一个切片，底部对应第 0 个
+  const top = ((n - 1 - currentIndex.value) / (n - 1)) * maxTop;
   return { height: `${thumbH}px`, transform: `translateY(${top}px)` };
 });
 
@@ -77,7 +79,8 @@ function yToIndex(clientY: number) {
   const rect = el.getBoundingClientRect();
   const frac = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
   const n = stripItems.value.length;
-  return Math.min(n - 1, Math.round(frac * (n - 1)));
+  // 反转：顶部 (frac=0) 对应最后一个切片
+  return Math.min(n - 1, Math.round((1 - frac) * (n - 1)));
 }
 
 let scrubbing = false;
@@ -100,7 +103,8 @@ function onScrollUp() {
 function onScrollWheel(e: WheelEvent) {
   const n = stripItems.value.length;
   if (n <= 1) return;
-  const dir = e.deltaY > 0 ? 1 : -1;
+  // 反转：向下滚动 (deltaY>0) 对应切片序号减小，与「顶部=最后切片」一致
+  const dir = e.deltaY > 0 ? -1 : 1;
   goToIndex(Math.min(n - 1, Math.max(0, currentIndex.value + dir)));
 }
 function measureTrack() {
@@ -314,7 +318,7 @@ async function onExport() {
       <div class="zoom-badge">{{ zoom.toFixed(2) }}x</div>
     </div>
 
-    <!-- 多帧 / 同系列多切片 竖向滚动条：位置对应图像序号，滚动/拖拽即切换（无序号按钮） -->
+    <!-- 多帧 / 同系列多切片 竖向滚动条：方向已反转（顶部=最后切片，底部=第0切片） -->
     <div
       class="frame-scroll"
       ref="scrollRef"

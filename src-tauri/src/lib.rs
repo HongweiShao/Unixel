@@ -177,9 +177,51 @@ pub(crate) fn decode_dicom_file(path: &str) -> Result<DicomImage, String> {
     }
 
     // HU（已应用 Modality LUT / Rescale）。返回的是强度值（CT 即 HU），前端实时做窗宽窗位。
-    let hu: Vec<f32> = pd
+    let mut hu: Vec<f32> = pd
         .to_vec::<f32>()
         .map_err(|e| format!("像素值转换失败: {}", e))?;
+
+    // 多帧 DICOM：按逐帧解剖位置重排帧序，使帧序符合物理层叠
+    //（数组首帧=inferior，末帧=superior，与多文件系列/滚动条顶部=superior 一致）。
+    // 仅 Enhanced 多帧具备逐帧 PlanePositionSequence；传统多帧（文件内已顺序）保持原序。
+    if frames > 1 {
+        if let (Some(oop), Some(per_pos)) = (
+            obj.element_by_name("ImageOrientationPatient")
+                .ok()
+                .and_then(|e| e.to_str().ok())
+                .and_then(|s| parse_ds_vec(&s)),
+            per_frame_positions(&obj),
+        ) {
+            if oop.len() == 6 && per_pos.len() == frames as usize {
+                let normal = normalize3(&cross3(
+                    &[oop[0], oop[1], oop[2]],
+                    &[oop[3], oop[4], oop[5]],
+                ));
+                // 方向校正：DICOM 患者坐标系 +Z = superior；normal[2]<0 表示投影升序对应
+                // superior→inferior，取反使升序=inferior→superior。
+                let flip = if normal[2] >= 0.0 { 1.0 } else { -1.0 };
+                let npx = (width * height) as usize;
+                let mut idxs: Vec<usize> = (0..frames as usize).collect();
+                idxs.sort_by(|&a, &b| {
+                    let ka = (per_pos[a][0] * normal[0]
+                        + per_pos[a][1] * normal[1]
+                        + per_pos[a][2] * normal[2])
+                        * flip;
+                    let kb = (per_pos[b][0] * normal[0]
+                        + per_pos[b][1] * normal[1]
+                        + per_pos[b][2] * normal[2])
+                        * flip;
+                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut reordered = vec![0.0f32; hu.len()];
+                for (new_i, &old_i) in idxs.iter().enumerate() {
+                    reordered[new_i * npx..(new_i + 1) * npx]
+                        .copy_from_slice(&hu[old_i * npx..(old_i + 1) * npx]);
+                }
+                hu = reordered;
+            }
+        }
+    }
 
     let filename = Path::new(path)
         .file_name()
@@ -309,6 +351,25 @@ pub(crate) fn decode_nifti(path: &str) -> Result<NiftiVolume, String> {
     let obj = ReaderOptions::new()
         .read_file(path)
         .map_err(|e| format!("读取 NIfTI 失败: {}", e))?;
+    // 取仿射（优先 sform，其次 qform）以判断第三轴(k)指向。NIfTI 解剖方法下 +Z = superior；
+    // aff 第 3 列第 3 行（列主序存储的第 10 个元素）即 k 轴位移向量的 superior(+Z) 分量。
+    // <0 表示 k 增大指向 inferior，需翻转 z 使 k 增大=inferior→superior（与多文件/多帧一致）。
+    let hdr = obj.header();
+    // 第三轴(k) 指向：NIfTI 解剖方法下 +Z = superior。
+    // sform 优先（其仿射第3列第3行 = srow_z[2]）；否则用 qform 四元数推导；
+    // 二者皆无（纯像素对齐）则不翻转。
+    let flip_z = if hdr.sform_code > 0 {
+        hdr.srow_z[2] < 0.0
+    } else if hdr.qform_code > 0 {
+        let b = hdr.quatern_b as f64;
+        let c = hdr.quatern_c as f64;
+        let r22 = 1.0 - 2.0 * (b * b + c * c);
+        let qfac = if hdr.pixdim[0] < 0.0 { -1.0 } else { 1.0 };
+        let kz = r22 * (hdr.pixdim[3] as f64).abs() * qfac;
+        kz < 0.0
+    } else {
+        false
+    };
     let volume = obj
         .into_volume()
         .into_ndarray::<f32>()
@@ -324,12 +385,14 @@ pub(crate) fn decode_nifti(path: &str) -> Result<NiftiVolume, String> {
 
     // 显式按逻辑索引 [x][y][z] 取出体素，得到确定的 [x][y][z]（z 最内）布局，
     // 避免依赖 into_raw_vec 的内存排布假设（NIfTI 文件实际为 x 最内）。
+    // 按 flip_z 决定是否沿 z 翻转，使 k 增大=inferior→superior。
     let n = (nx as usize) * (ny as usize) * (nz as usize);
     let mut raw = Vec::with_capacity(n);
     for x in 0..nx as usize {
         for y in 0..ny as usize {
             for z in 0..nz as usize {
-                raw.push(volume[[x, y, z]]);
+                let zz = if flip_z { nz as usize - 1 - z } else { z };
+                raw.push(volume[[x, y, zz]]);
             }
         }
     }
@@ -1386,6 +1449,39 @@ fn normalize3(v: &[f64; 3]) -> [f64; 3] {
         [v[0] / n, v[1] / n, v[2] / n]
     }
 }
+// 解析 DICOM DS（十进制字符串，反斜杠分隔）为多值 f64 向量
+fn parse_ds_vec(s: &str) -> Option<Vec<f64>> {
+    let v: Vec<f64> = s
+        .split('\\')
+        .filter_map(|x| x.trim().parse::<f64>().ok())
+        .collect();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+// 读取 Enhanced 多帧 DICOM 的逐帧图像位置，用于按解剖位置重排帧序：
+// PerFrameFunctionalGroupsSequence -> 各项 -> PlanePositionSequence -> ImagePositionPatient(0020,0032)
+// 返回每帧的位置向量（长度需等于帧数）；非 Enhanced 多帧或无逐帧位置时返回 None。
+fn per_frame_positions(obj: &InMemDicomObject) -> Option<Vec<Vec<f64>>> {
+    let pfgs = obj.element_by_name("PerFrameFunctionalGroupsSequence").ok()?;
+    let items = pfgs.items()?;
+    let mut out: Vec<Vec<f64>> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let pps = item.element_by_name("PlanePositionSequence").ok()?;
+        let pps_item = pps.items()?.first()?;
+        let ipp_elem = pps_item.element_by_name("ImagePositionPatient").ok()?;
+        let s = ipp_elem.to_str().ok()?;
+        match parse_ds_vec(&s) {
+            Some(v) if v.len() == 3 => out.push(v),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 // 同系列内的排序键：优先 ImagePositionPatient 沿法向量投影；其次 InstanceNumber；再次 SliceLocation
 fn series_sort_key(
     ipp: &Option<Vec<f64>>,
@@ -1395,7 +1491,11 @@ fn series_sort_key(
 ) -> f64 {
     if let (Some(pos), Some(n)) = (ipp, normal) {
         if pos.len() == 3 {
-            return pos[0] * n[0] + pos[1] * n[1] + pos[2] * n[2];
+            let proj = pos[0] * n[0] + pos[1] * n[1] + pos[2] * n[2];
+            // 方向校正：DICOM 患者坐标系 +Z = superior；normal[2]<0 时投影升序对应
+            // superior→inferior，取反使升序=inferior→superior（末帧=superior，与滚动条顶部一致）。
+            let flip = if n[2] >= 0.0 { 1.0 } else { -1.0 };
+            return proj * flip;
         }
     }
     if let Some(i) = instance {
