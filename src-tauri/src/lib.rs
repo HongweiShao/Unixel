@@ -7,8 +7,14 @@ use std::path::{Path, PathBuf};
 use dicom_core::Tag;
 use dicom_core::dictionary::DataDictionary;
 use dicom_core::header::Header;
-use dicom_object::InMemDicomObject;
 use image::GenericImageView;
+// 文字叠加（四角 DICOM 标签 + 居中斜向半透明水印）
+use image::imageops;
+use image::RgbaImage;
+use imageproc::drawing::{draw_text_mut, text_size};
+use imageproc::geometric_transformations::{rotate, Interpolation};
+use ab_glyph::{FontRef, PxScale};
+use dicom_object::{FileDicomObject, InMemDicomObject};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -645,34 +651,235 @@ fn load_htj2k(path: String) -> Result<DicomImage, String> {
     decode_htj2k(&bytes)
 }
 
-// 导出当前帧：前端传入该帧 HU 像素字节 + 尺寸/光度解释/窗设置
-#[tauri::command]
-fn export_frame(
-    pixel_bytes: Vec<u8>,
-    width: u32,
-    height: u32,
-    photometric: String,
+// ---------- 导出 JPEG（带四角 DICOM 标签叠加 + 居中斜向半透明水印） ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OverlayTag {
+    corner: u8,     // 0=左上 1=右上 2=左下 3=右下
+    keyword: String, // DICOM keyword；"__WINDOW__" 表示窗位/窗宽
+    display: String, // 中文显示标签
+}
+
+// 按源文件解码出所有帧的 HU 像素（f32 LE，长度 = w*h），并返回可选 DICOM 对象（供读标签）
+fn load_source_frames(
+    path: &str,
+) -> Result<(Vec<Vec<f32>>, Option<FileDicomObject<InMemDicomObject>>, u32, u32), String> {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".dcm") || lower.ends_with(".dicom") {
+        let obj = dicom_object::open_file(path).ok();
+        let img = decode_dicom_file(path)?;
+        let w = img.meta.width;
+        let h = img.meta.height;
+        let hu_all: Vec<f32> = img
+            .pixel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let per = (w * h) as usize;
+        let frames: Vec<Vec<f32>> = (0..img.meta.frames)
+            .map(|f| {
+                let s = f as usize;
+                hu_all[s * per..(s + 1) * per].to_vec()
+            })
+            .collect();
+        Ok((frames, obj, w, h))
+    } else if lower.ends_with(".nii") || lower.ends_with(".nii.gz") {
+        let vol = decode_nifti(path)?;
+        let [nx, ny, nz] = vol.meta.dims;
+        let vox: Vec<f32> = vol
+            .voxel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut frames = Vec::with_capacity(nz as usize);
+        for z in 0..nz as usize {
+            let mut f = vec![0f32; (nx * ny) as usize];
+            for x in 0..nx as usize {
+                for y in 0..ny as usize {
+                    f[y * nx as usize + x] = vox[((x * ny as usize) + y) * nz as usize + z];
+                }
+            }
+            frames.push(f);
+        }
+        Ok((frames, None, nx, ny))
+    } else {
+        let img = decode_regular_image(path)?;
+        let w = img.meta.width;
+        let h = img.meta.height;
+        let hu_all: Vec<f32> = img
+            .pixel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let per = (w * h) as usize;
+        Ok((vec![hu_all[0..per].to_vec()], None, w, h))
+    }
+}
+
+// 读取单个叠加标签的显示值（DICOM 按 keyword 读取；__WINDOW__ 用传入窗设置）
+fn overlay_value(
+    obj: &Option<FileDicomObject<InMemDicomObject>>,
+    tag: &OverlayTag,
     wc: f64,
     ww: f64,
-    format: String,
+) -> Option<String> {
+    if tag.keyword == "__WINDOW__" {
+        return Some(format!("窗位 {} / 窗宽 {}", wc.round(), ww.round()));
+    }
+    let obj = obj.as_ref()?;
+    obj.element_by_name(&tag.keyword)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+}
+
+// 在某角按行绘制文字（同角多行按固定列表顺序堆叠），白字 + 暗色阴影保证可读
+fn draw_corner_lines(img: &mut RgbaImage, corner: u8, lines: &[String], font: &FontRef) {
+    if lines.is_empty() {
+        return;
+    }
+    let margin = 16u32;
+    let font_size = 26.0_f32;
+    let scale = PxScale { x: font_size, y: font_size };
+    let line_h = (font_size * 1.3) as i32;
+    let total_h = line_h * lines.len() as i32;
+    let start_y = if corner < 2 {
+        margin as i32
+    } else {
+        img.height() as i32 - margin as i32 - total_h
+    };
+    let mut y = start_y;
+    for line in lines {
+        let (tw, _) = text_size(scale, font, line);
+        let x = match corner {
+            0 | 2 => margin as i32,
+            _ => (img.width() as i32 - tw as i32 - margin as i32).max(margin as i32),
+        };
+        draw_text_mut(img, image::Rgba([0, 0, 0, 170]), x + 1, y + 1, scale, font, line);
+        draw_text_mut(img, image::Rgba([255, 255, 255, 235]), x, y, scale, font, line);
+        y += line_h;
+    }
+}
+
+// 居中、斜向（-30°）、半透明水印
+fn draw_watermark(img: &mut RgbaImage, text: &str, font: &FontRef) {
+    let font_size = ((img.width().min(img.height()) as f32) * 0.06).max(22.0);
+    let scale = PxScale { x: font_size, y: font_size };
+    let (tw, th) = text_size(scale, font, text);
+    let mut layer = RgbaImage::new(img.width(), img.height());
+    let x = ((img.width() as i32 - tw as i32) / 2).max(0);
+    let y = ((img.height() as i32 - th as i32) / 2).max(0);
+    draw_text_mut(&mut layer, image::Rgba([255, 255, 255, 110]), x, y, scale, font, text);
+    let center = (layer.width() as f32 / 2.0, layer.height() as f32 / 2.0);
+    let rotated = rotate(
+        &layer,
+        center,
+        -30.0_f32.to_radians(),
+        Interpolation::Bilinear,
+        image::Rgba([0, 0, 0, 0]),
+    );
+    imageops::overlay(img, &rotated, 0, 0);
+}
+
+// 导出 JPEG：支持「当前帧 / 所有（多帧全帧或同系列全切片）」，可叠加四角 DICOM 标签与水印
+#[tauri::command]
+fn export_jpeg(
+    mode: String,        // "current" | "all"
+    file_path: String,   // 当前源文件（current 取指定帧；all 多帧取全部帧）
+    series_paths: Vec<String>, // all 多文件系列：有序切片路径；其余为空
+    frame_index: u32,    // current 多帧：指定帧号
+    wc: f64,
+    ww: f64,
+    photometric: String,
+    overlays: Vec<OverlayTag>,
+    watermark: String,
     quality: u8,
-    output_path: String,
+    output: String,      // current: 文件路径；all: 目录
 ) -> Result<String, String> {
-    let hu: Vec<f32> = pixel_bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    export_frame_from_pixels(
-        &hu,
-        width,
-        height,
-        &photometric,
-        wc,
-        ww,
-        &format,
-        quality,
-        &output_path,
-    )
+    let font_data = include_bytes!("../resources/fonts/simhei.ttf");
+    let font = FontRef::try_from_slice(font_data)
+        .map_err(|e| format!("加载字体失败: {:?}", e))?;
+
+    // 收集导出目标：(帧 HU 像素, 可选 DICOM 对象, 宽, 高)
+    let mut targets: Vec<(Vec<f32>, Option<FileDicomObject<InMemDicomObject>>, u32, u32)> =
+        Vec::new();
+    if mode == "all" && !series_paths.is_empty() {
+        for p in &series_paths {
+            let (frames, obj, w, h) = load_source_frames(p)?;
+            if let Some(f) = frames.into_iter().next() {
+                targets.push((f, obj, w, h));
+            }
+        }
+    } else {
+        let (frames, obj, w, h) = load_source_frames(&file_path)?;
+        if mode == "all" {
+            for f in frames {
+                targets.push((f, obj.clone(), w, h));
+            }
+        } else {
+            let idx = (frame_index as usize).min(frames.len().saturating_sub(1));
+            if let Some(f) = frames.into_iter().nth(idx) {
+                targets.push((f, obj, w, h));
+            }
+        }
+    }
+
+    let n = targets.len();
+    if n == 0 {
+        return Err("没有可导出的帧".into());
+    }
+
+    let is_dir = mode == "all";
+    let q = quality.clamp(10, 100);
+    for (i, (hu, obj, w, h)) in targets.into_iter().enumerate() {
+        let invert = photometric == "MONOCHROME1";
+        let per = (w * h) as usize;
+        let mut rgba = vec![0u8; per * 4];
+        apply_window_rust(&hu, wc, ww, invert, &mut rgba);
+        let mut img = RgbaImage::from_raw(w, h, rgba).ok_or("图像缓冲错误")?;
+
+        // 四角标签分组（同角按列表顺序逐行）
+        let mut by_corner: [Vec<String>; 4] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for t in &overlays {
+            if let Some(v) = overlay_value(&obj, t, wc, ww) {
+                by_corner[(t.corner as usize) % 4].push(format!("{}: {}", t.display, v));
+            }
+        }
+        for c in 0..4 {
+            draw_corner_lines(&mut img, c as u8, &by_corner[c], &font);
+        }
+        if !watermark.trim().is_empty() {
+            draw_watermark(&mut img, watermark.trim(), &font);
+        }
+
+        let out_path = if is_dir {
+            let prefix = if file_path.to_lowercase().ends_with(".nii")
+                || file_path.to_lowercase().ends_with(".nii.gz")
+            {
+                "slice"
+            } else if series_paths.is_empty() {
+                "frame"
+            } else {
+                "slice"
+            };
+            Path::new(&output).join(format!("{}_{:03}.jpg", prefix, i + 1))
+        } else {
+            Path::new(&output).to_path_buf()
+        };
+
+        let mut buf = Vec::new();
+        {
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, q);
+            enc.encode_image(&img)
+                .map_err(|e| format!("JPEG 编码失败: {}", e))?;
+        }
+        std::fs::write(&out_path, &buf).map_err(|e| format!("写入失败: {}", e))?;
+    }
+
+    Ok(format!("已导出 {} 张 JPEG", n))
 }
 
 // ---------- 文件标签（详情对话框） ----------
@@ -1924,7 +2131,7 @@ pub fn run() {
             load_image,
             load_nifti,
             load_htj2k,
-            export_frame,
+            export_jpeg,
             file_tags,
             list_folder_images,
             file_series_info,

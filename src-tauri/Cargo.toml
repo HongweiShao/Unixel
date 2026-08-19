@@ -24,6 +24,9 @@ dicom-dictionary-std = "0.7"
 dicom-core = "0.7"
 # 常规图像与导出
 image = { version = "0.25", features = ["png", "jpeg", "tiff"] }
+# 文字叠加（四角 DICOM 标签 + 居中斜向半透明水印），依赖 ab_glyph 加载 CJK 字体
+imageproc = "0.25"
+ab_glyph = "0.2"
 # NIfTI 体数据（MPR 基础）
 nifti = { version = "0.11", features = ["ndarray_volumes"] }
 # HTJ2K（纯 Rust 移植 OpenJPH，无 C/C++ FFI）：无损 TS 201 / 有损 TS 203

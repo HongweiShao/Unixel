@@ -301,6 +301,9 @@ const seriesFiles = computed(() => {
   return imageList.value.filter((i) => i.info.seriesGroup === g);
 });
 
+// 当前系列有序完整文件路径（"所有"导出时逐片传给后端）
+const seriesPaths = computed(() => seriesFiles.value.map((i) => i.info.path));
+
 // 解码单个图像像素（不触碰导入 spinner，供滚动按需调用，结果缓存到 item.view）
 async function decodeItem(item: OpenedImage) {
   if (item.view) return;
@@ -632,6 +635,7 @@ onMounted(async () => {
           :meta="currentView.meta"
           :frames="currentView.frames"
           :series-files="seriesFiles"
+          :series-paths="seriesPaths"
           :active-id="activeId"
           @select-file="selectImage"
         />

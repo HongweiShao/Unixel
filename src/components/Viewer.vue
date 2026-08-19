@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import type { DicomMeta } from "../types";
 import { applyWindow } from "../windowing";
-import { save } from "@tauri-apps/plugin-dialog";
+import { save, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 
 const props = defineProps<{
@@ -10,6 +10,8 @@ const props = defineProps<{
   frames: Float32Array[]; // 每帧 HU 数组，长度 = width*height
   // 当前选中文件所属系列的有序文件列表（按位置排序）；长度>1 时画布右侧竖条列出切片便于快速切换
   seriesFiles?: Array<{ id: number; info: { filename: string } }>;
+  // 当前系列有序完整文件路径（"所有"导出时逐片传给后端）
+  seriesPaths?: string[];
   activeId?: number | null;
 }>();
 const emit = defineEmits<{ selectFile: [id: number] }>();
@@ -244,61 +246,81 @@ function resetView() {
   frameIndex.value = 0;
 }
 
-// 导出当前帧（按当前窗设置）为 PNG/JPEG/HTJ2K
-const exportFormat = ref<"png" | "jpeg" | "htj2k">("png");
+// 导出 JPEG（带 DICOM 标签叠加 + 水印）
+const exportJpegOpen = ref(false);
+const exportScope = ref<"current" | "all">("current");
 const exportQuality = ref(90);
+const watermarkText = ref("");
 const exporting = ref(false);
 const exportMsg = ref<string | null>(null);
 const isRealFile = computed(() => !props.meta.path.startsWith("mock"));
+const isMultiframe = computed(() => props.meta.frames > 1);
 
-async function onExport() {
+// 可选叠加标签：固定角映射（0=左上 1=右上 2=左下 3=右下），同角内按列表顺序逐行
+const selectableTags = [
+  { key: "InstitutionName", label: "机构名称", corner: 0 },
+  { key: "Manufacturer", label: "制造商", corner: 0 },
+  { key: "PatientName", label: "患者姓名", corner: 1 },
+  { key: "PatientID", label: "患者编号", corner: 1 },
+  { key: "StudyDate", label: "检查日期", corner: 2 },
+  { key: "Modality", label: "模态", corner: 2 },
+  { key: "SeriesDescription", label: "序列描述", corner: 2 },
+  { key: "__WINDOW__", label: "窗位/窗宽", corner: 3 },
+  { key: "InstanceNumber", label: "图像序号", corner: 3 },
+] as const;
+const cornerNames = ["左上", "右上", "左下", "右下"];
+const selectedTags = ref<string[]>([]);
+
+async function onExportJpeg() {
   if (!isRealFile.value) return;
-  exportMsg.value = null;
-  exporting.value = true;
-  try {
-    const frame = props.frames[frameIndex.value];
-    if (!frame) return;
-    // 取当前帧 HU 像素字节（f32 LE）回传后端做窗映射与编码
-    const pixelBytes = new Uint8Array(
-      frame.buffer,
-      frame.byteOffset,
-      frame.byteLength
-    );
-    const fmt = exportFormat.value;
-    const ext = fmt === "png" ? "png" : fmt === "jpeg" ? "jpg" : "jph";
+  let output: string | null;
+  if (exportScope.value === "current") {
     const base = props.meta.filename.replace(
       /\.(dcm|dicom|nii(\.gz)?|j2c|jph|png|jpe?g|tif?f)$/i,
       ""
     );
     const suggested = `${base}_wc${Math.round(wc.value)}_ww${Math.round(
       ww.value
-    )}.${ext}`;
-    const filters =
-      fmt === "png"
-        ? [{ name: "PNG", extensions: ["png"] }]
-        : fmt === "jpeg"
-          ? [{ name: "JPEG", extensions: ["jpg", "jpeg"] }]
-          : [{ name: "HTJ2K", extensions: ["jph", "j2c"] }];
-    const out = await save({ defaultPath: suggested, filters });
-    if (!out) return; // 用户取消
-    const saved = await invoke<string>("export_frame", {
-      pixelBytes,
-      width: props.meta.width,
-      height: props.meta.height,
-      photometric: props.meta.photometric,
+    )}.jpg`;
+    output = await save({
+      defaultPath: suggested,
+      filters: [{ name: "JPEG", extensions: ["jpg", "jpeg"] }],
+    });
+  } else {
+    output = await open({ directory: true, title: "选择导出文件夹" });
+  }
+  if (!output) return; // 用户取消
+  exporting.value = true;
+  exportMsg.value = null;
+  try {
+    const overlays = selectableTags
+      .filter((t) => selectedTags.value.includes(t.key))
+      .map((t) => ({ corner: t.corner, keyword: t.key, display: t.label }));
+    const seriesPaths =
+      exportScope.value === "all" && !isMultiframe.value
+        ? props.seriesPaths ?? []
+        : [];
+    await invoke<string>("export_jpeg", {
+      mode: exportScope.value,
+      filePath: props.meta.path,
+      seriesPaths,
+      frameIndex: frameIndex.value,
       wc: wc.value,
       ww: ww.value,
-      format: fmt,
+      photometric: props.meta.photometric,
+      overlays,
+      watermark: watermarkText.value,
       quality: exportQuality.value,
-      outputPath: out,
+      output,
     });
-    exportMsg.value = `已导出：${saved}`;
+    exportMsg.value = "已导出：" + output;
   } catch (e) {
     exportMsg.value =
       "导出失败：" +
       (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
   } finally {
     exporting.value = false;
+    exportJpegOpen.value = false;
   }
 }
 </script>
@@ -363,21 +385,8 @@ async function onExport() {
 
       <section class="group export">
         <div class="group-title"><span>导出</span></div>
-        <label class="export-label">
-          格式
-          <select v-model="exportFormat">
-            <option value="png">PNG</option>
-            <option value="jpeg">JPEG</option>
-            <option value="htj2k">HTJ2K</option>
-          </select>
-        </label>
-        <label v-if="exportFormat === 'jpeg'" class="export-label">
-          质量
-          <input type="range" min="10" max="100" step="1" v-model.number="exportQuality" />
-          <span class="val">{{ exportQuality }}</span>
-        </label>
-        <button class="export-btn" :disabled="!isRealFile || exporting" @click="onExport">
-          {{ exporting ? "导出中…" : "导出当前帧" }}
+        <button class="export-btn" :disabled="!isRealFile || exporting" @click="exportJpegOpen = true">
+          {{ exporting ? "导出中…" : "导出JPEG" }}
         </button>
         <span v-if="!isRealFile" class="hint-sm">示例数据不可导出</span>
         <span
@@ -388,6 +397,48 @@ async function onExport() {
         >
       </section>
     </aside>
+
+    <!-- 导出 JPEG 对话框 -->
+    <div v-if="exportJpegOpen" class="modal-mask" @click.self="exportJpegOpen = false">
+      <div class="modal export-modal">
+        <div class="modal-title">导出 JPEG</div>
+
+        <div class="modal-row">
+          <span class="modal-label">范围</span>
+          <label class="radio"><input type="radio" value="current" v-model="exportScope" /> 当前帧</label>
+          <label class="radio"><input type="radio" value="all" v-model="exportScope" /> 所有{{ isMultiframe ? "帧" : "切片" }}</label>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">标签叠加</span>
+          <div class="tag-grid">
+            <label v-for="t in selectableTags" :key="t.key" class="tag-chk">
+              <input type="checkbox" :value="t.key" v-model="selectedTags" />
+              <span>{{ t.label }}</span>
+              <span class="corner-hint">{{ cornerNames[t.corner] }}</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">水印</span>
+          <input type="text" v-model="watermarkText" placeholder="可留空（不添加水印）" />
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">质量</span>
+          <input type="range" min="10" max="100" step="1" v-model.number="exportQuality" />
+          <span class="val">{{ exportQuality }}</span>
+        </div>
+
+        <div class="modal-actions">
+          <button @click="exportJpegOpen = false">取消</button>
+          <button class="primary" :disabled="exporting" @click="onExportJpeg">
+            {{ exporting ? "导出中…" : "导出" }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -554,5 +605,100 @@ async function onExport() {
 .hint-sm {
   font-size: 11px;
   color: var(--fg-dim);
+}
+
+/* 导出 JPEG 对话框 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.modal {
+  background: var(--bg-1, #14161a);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  width: 420px;
+  max-width: 92vw;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.export-modal .modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 14px;
+}
+.modal-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.modal-label {
+  width: 64px;
+  flex: none;
+  font-size: 13px;
+  color: var(--fg-dim);
+  padding-top: 3px;
+}
+.modal-row .radio {
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 14px;
+  cursor: pointer;
+}
+.tag-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+  flex: 1;
+}
+.tag-chk {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.tag-chk .corner-hint {
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.modal-row input[type="text"] {
+  flex: 1;
+  background: var(--bg-2, #1c1f26);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.modal-row input[type="range"] {
+  flex: 1;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+.modal-actions button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 4px;
+  padding: 7px 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.modal-actions .primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 </style>
