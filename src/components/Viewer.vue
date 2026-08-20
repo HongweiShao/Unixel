@@ -256,19 +256,30 @@ const exportMsg = ref<string | null>(null);
 const isRealFile = computed(() => !props.meta.path.startsWith("mock"));
 const isMultiframe = computed(() => props.meta.frames > 1);
 
-// 可选叠加标签：固定角映射（0=左上 1=右上 2=左下 3=右下），同角内按列表顺序逐行
+// 可选叠加标签：固定角映射（0=左上 1=右上 2=左下 3=右下），同角内按列表顺序逐行（自上而下）
 const selectableTags = [
+  // 左上：机构名称 → 患者编号 → 患者姓名 → 患者性别
   { key: "InstitutionName", label: "机构名称", corner: 0 },
-  { key: "Manufacturer", label: "制造商", corner: 0 },
-  { key: "PatientName", label: "患者姓名", corner: 1 },
-  { key: "PatientID", label: "患者编号", corner: 1 },
-  { key: "StudyDate", label: "检查日期", corner: 2 },
-  { key: "Modality", label: "模态", corner: 2 },
-  { key: "SeriesDescription", label: "序列描述", corner: 2 },
-  { key: "__WINDOW__", label: "窗位/窗宽", corner: 3 },
-  { key: "InstanceNumber", label: "图像序号", corner: 3 },
+  { key: "PatientID", label: "患者编号", corner: 0 },
+  { key: "PatientName", label: "患者姓名", corner: 0 },
+  { key: "PatientSex", label: "患者性别", corner: 0 },
+  // 右上：序列UID → 检查日期 → 模态 → 窗宽窗位
+  { key: "SeriesInstanceUID", label: "序列UID", corner: 1 },
+  { key: "StudyDate", label: "检查日期", corner: 1 },
+  { key: "Modality", label: "模态", corner: 1 },
+  { key: "__WINDOW__", label: "窗宽窗位", corner: 1 },
+  // 左下：制造商 → 设备型号名称
+  { key: "Manufacturer", label: "制造商", corner: 2 },
+  { key: "ManufacturerModelName", label: "设备型号名称", corner: 2 },
 ] as const;
 const cornerNames = ["左上", "右上", "左下", "右下"];
+// 按角分组的标签（隐藏无标签的角，如右下专用于水印），供对话框四角分组渲染
+const tagGroups = cornerNames
+  .map((name, i) => ({
+    name,
+    tags: selectableTags.filter((t) => t.corner === i),
+  }))
+  .filter((g) => g.tags.length > 0);
 const selectedTags = ref<string[]>([]);
 
 async function onExportJpeg() {
@@ -411,12 +422,18 @@ async function onExportJpeg() {
 
         <div class="modal-row">
           <span class="modal-label">标签叠加</span>
-          <div class="tag-grid">
-            <label v-for="t in selectableTags" :key="t.key" class="tag-chk">
-              <input type="checkbox" :value="t.key" v-model="selectedTags" />
-              <span>{{ t.label }}</span>
-              <span class="corner-hint">{{ cornerNames[t.corner] }}</span>
-            </label>
+          <div class="tag-corners">
+            <div class="tag-corner" v-for="g in tagGroups" :key="g.name">
+              <div class="corner-title">{{ g.name }}</div>
+              <label
+                v-for="t in g.tags"
+                :key="t.key"
+                class="tag-chk"
+              >
+                <input type="checkbox" :value="t.key" v-model="selectedTags" />
+                <span>{{ t.label }}</span>
+              </label>
+            </div>
           </div>
         </div>
 
@@ -652,11 +669,23 @@ async function onExportJpeg() {
   margin-right: 14px;
   cursor: pointer;
 }
-.tag-grid {
+.tag-corners {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px 14px;
+  gap: 10px 18px;
   flex: 1;
+}
+.tag-corner {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 0;
+}
+.corner-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #4da3ff);
+  margin-bottom: 6px;
 }
 .tag-chk {
   display: flex;
@@ -664,10 +693,7 @@ async function onExportJpeg() {
   gap: 6px;
   font-size: 13px;
   cursor: pointer;
-}
-.tag-chk .corner-hint {
-  font-size: 11px;
-  color: var(--fg-dim);
+  margin-bottom: 4px;
 }
 .modal-row input[type="text"] {
   flex: 1;

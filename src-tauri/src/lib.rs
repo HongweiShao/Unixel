@@ -8,11 +8,9 @@ use dicom_core::Tag;
 use dicom_core::dictionary::DataDictionary;
 use dicom_core::header::Header;
 use image::GenericImageView;
-// 文字叠加（四角 DICOM 标签 + 居中斜向半透明水印）
-use image::imageops;
+// 文字叠加（四角 DICOM 标签 + 右下角水平水印）
 use image::RgbaImage;
 use imageproc::drawing::{draw_text_mut, text_size};
-use imageproc::geometric_transformations::{rotate, Interpolation};
 use ab_glyph::{FontRef, PxScale};
 use dicom_object::{FileDicomObject, InMemDicomObject};
 
@@ -670,23 +668,58 @@ fn overlay_value(
         .map(|s| s.to_string())
 }
 
+// 按最大行宽（不超过图像中线）逐字符贪心折行，避免长标签越过中线或与对向角内容重叠
+fn wrap_text_to_width(line: &str, max_w: i32, scale: PxScale, font: &FontRef) -> Vec<String> {
+    let (full_w, _) = text_size(scale, font, line);
+    if full_w as i32 <= max_w {
+        return vec![line.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0i32;
+    for ch in line.chars() {
+        let (cw, _) = text_size(scale, font, &ch.to_string());
+        let cw = cw as i32;
+        if !cur.is_empty() && cur_w + cw > max_w {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 // 在某角按行绘制文字（同角多行按固定列表顺序堆叠），白字 + 暗色阴影保证可读
+// 字体大小自适应：以参考串「M测0」平均字符宽推算，使整图宽度约容纳 75 个字符；
+// 单行超过中线（半宽）时自动折行，确保左上/右上角内容互不重叠
 fn draw_corner_lines(img: &mut RgbaImage, corner: u8, lines: &[String], font: &FontRef) {
     if lines.is_empty() {
         return;
     }
     let margin = 16u32;
-    let font_size = 26.0_f32;
+    // 字体尺寸：以平均字符宽估算，使整图宽约放下 75 个字符（参考串含中英数三类字符）
+    let (ref_w, _) = text_size(PxScale { x: 1.0, y: 1.0 }, font, "M测0");
+    let avg_char = (ref_w as f32 / 3.0).max(0.001);
+    let font_size = ((img.width() as f32) / 75.0 / avg_char).clamp(8.0, 40.0);
     let scale = PxScale { x: font_size, y: font_size };
     let line_h = (font_size * 1.3) as i32;
-    let total_h = line_h * lines.len() as i32;
+    let max_w = (img.width() as i32) / 2 - margin as i32; // 不超过中线（半宽）
+    let wrapped: Vec<String> = lines
+        .iter()
+        .flat_map(|l| wrap_text_to_width(l.as_str(), max_w, scale, font))
+        .collect();
+    let total_h = line_h * wrapped.len() as i32;
     let start_y = if corner < 2 {
         margin as i32
     } else {
         img.height() as i32 - margin as i32 - total_h
     };
     let mut y = start_y;
-    for line in lines {
+    for line in &wrapped {
         let (tw, _) = text_size(scale, font, line);
         let x = match corner {
             0 | 2 => margin as i32,
@@ -698,24 +731,17 @@ fn draw_corner_lines(img: &mut RgbaImage, corner: u8, lines: &[String], font: &F
     }
 }
 
-// 居中、斜向（-30°）、半透明水印
+// 右下角、水平单行半透明水印（非空时已在 export_jpeg 中判定后调用）
 fn draw_watermark(img: &mut RgbaImage, text: &str, font: &FontRef) {
     let font_size = ((img.width().min(img.height()) as f32) * 0.06).max(22.0);
     let scale = PxScale { x: font_size, y: font_size };
     let (tw, th) = text_size(scale, font, text);
-    let mut layer = RgbaImage::new(img.width(), img.height());
-    let x = ((img.width() as i32 - tw as i32) / 2).max(0);
-    let y = ((img.height() as i32 - th as i32) / 2).max(0);
-    draw_text_mut(&mut layer, image::Rgba([255, 255, 255, 110]), x, y, scale, font, text);
-    let center = (layer.width() as f32 / 2.0, layer.height() as f32 / 2.0);
-    let rotated = rotate(
-        &layer,
-        center,
-        -30.0_f32.to_radians(),
-        Interpolation::Bilinear,
-        image::Rgba([0, 0, 0, 0]),
-    );
-    imageops::overlay(img, &rotated, 0, 0);
+    let margin = 16u32;
+    let x = (img.width() as i32 - tw as i32 - margin as i32).max(margin as i32);
+    let y = (img.height() as i32 - th as i32 - margin as i32).max(margin as i32);
+    // 暗色阴影 + 白字，保证不同背景下的可读性
+    draw_text_mut(img, image::Rgba([0, 0, 0, 150]), x + 1, y + 1, scale, font, text);
+    draw_text_mut(img, image::Rgba([255, 255, 255, 210]), x, y, scale, font, text);
 }
 
 // 导出 JPEG：支持「当前帧 / 所有（多帧全帧或同系列全切片）」，可叠加四角 DICOM 标签与水印
