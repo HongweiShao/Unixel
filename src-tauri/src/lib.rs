@@ -469,6 +469,8 @@ pub(crate) fn htj2k_decode(codestream: &[u8]) -> Result<(u32, u32, Vec<u8>), Str
 }
 
 // C1：HTJ2K 编码。gray: 8bit 灰度；lossless=true 用可逆 5/3 小波（TS 201）
+// 仅被 HTJ2K 往返测试使用；非测试构建下标记为允许死代码。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn htj2k_encode(
     gray: &[u8],
     width: u32,
@@ -560,73 +562,6 @@ fn apply_window_rust(hu: &[f32], wc: f64, ww: f64, invert: bool, out: &mut [u8])
     }
 }
 
-// 将 RGBA 缓冲编码并写入文件。PNG 无损；JPEG 转 RGB + 质量；HTJ2K 取灰度无损编码。
-fn encode_and_save(
-    width: u32,
-    height: u32,
-    rgba: &[u8],
-    format: &str,
-    quality: u8,
-    out: &Path,
-) -> Result<(), String> {
-    match format.to_lowercase().as_str() {
-        "png" => {
-            let img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
-                width,
-                height,
-                rgba.to_vec(),
-            )
-            .ok_or("PNG 图像缓冲构建失败（尺寸与数据长度不匹配）")?;
-            img.save(out).map_err(|e| format!("保存 PNG 失败: {}", e))?;
-        }
-        "jpeg" | "jpg" => {
-            let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-            for p in rgba.chunks_exact(4) {
-                rgb.push(p[0]);
-                rgb.push(p[1]);
-                rgb.push(p[2]);
-            }
-            let file =
-                std::fs::File::create(out).map_err(|e| format!("创建文件失败: {}", e))?;
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                file,
-                quality.clamp(1, 100),
-            );
-            enc.encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
-                .map_err(|e| format!("编码 JPEG 失败: {}", e))?;
-        }
-        other => return Err(format!("不支持的导出格式: {}", other)),
-    }
-    Ok(())
-}
-
-// 统一导出核心：给定单帧 HU 像素 + 窗设置，编码为 PNG/JPEG/HTJ2K 写盘。
-pub(crate) fn export_frame_from_pixels(
-    hu: &[f32],
-    width: u32,
-    height: u32,
-    photometric: &str,
-    wc: f64,
-    ww: f64,
-    format: &str,
-    quality: u8,
-    output: &str,
-) -> Result<String, String> {
-    let invert = photometric == "MONOCHROME1";
-    let per = (width as usize) * (height as usize);
-    let mut rgba = vec![0u8; per * 4];
-    apply_window_rust(hu, wc, ww, invert, &mut rgba);
-
-    match format.to_lowercase().as_str() {
-        "htj2k" | "j2c" | "jph" => {
-            let gray: Vec<u8> = rgba.iter().step_by(4).copied().collect();
-            let bytes = htj2k_encode(&gray, width, height, true)?; // 默认无损
-            std::fs::write(output, &bytes).map_err(|e| format!("写入 HTJ2K 失败: {}", e))?;
-        }
-        _ => encode_and_save(width, height, &rgba, format, quality, Path::new(output))?,
-    }
-    Ok(output.to_string())
-}
 
 // ---------- Tauri commands ----------
 
@@ -1883,34 +1818,6 @@ mod tests {
         assert_eq!(first.width, 390);
         assert_eq!(first.height, 390);
         assert_eq!(first.frames, 1);
-    }
-
-    #[test]
-    fn export_sample_png_and_jpeg() {
-        let img = decode_dicom_file("tests/sample.dcm").expect("decode");
-        let n = img.meta.width as usize * img.meta.height as usize;
-        let hu: Vec<f32> = img
-            .pixel_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let hu = &hu[0..n];
-
-        let png = "tests/out_sample.png";
-        export_frame_from_pixels(hu, img.meta.width, img.meta.height, &img.meta.photometric, 40.0, 400.0, "png", 90, png)
-            .expect("export png");
-        let pimg = image::open(png).expect("read exported png");
-        assert_eq!(pimg.width(), 512);
-        assert_eq!(pimg.height(), 512);
-        let _ = std::fs::remove_file(png);
-
-        let jpg = "tests/out_sample.jpg";
-        export_frame_from_pixels(hu, img.meta.width, img.meta.height, &img.meta.photometric, 40.0, 400.0, "jpeg", 85, jpg)
-            .expect("export jpeg");
-        let jimg = image::open(jpg).expect("read exported jpeg");
-        assert_eq!(jimg.width(), 512);
-        assert_eq!(jimg.height(), 512);
-        let _ = std::fs::remove_file(jpg);
     }
 
     #[test]
