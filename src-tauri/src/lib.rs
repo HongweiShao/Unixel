@@ -856,16 +856,8 @@ fn export_jpeg(
         }
 
         let out_path = if is_dir {
-            let prefix = if file_path.to_lowercase().ends_with(".nii")
-                || file_path.to_lowercase().ends_with(".nii.gz")
-            {
-                "slice"
-            } else if series_paths.is_empty() {
-                "frame"
-            } else {
-                "slice"
-            };
-            Path::new(&output).join(format!("{}_{:03}.jpg", prefix, i + 1))
+            // 多帧 / 多切片 / NIfTI 体积均视为同一序列的切片，统一命名实现「多帧+多切片统一序列导出」
+            Path::new(&output).join(format!("slice_{:03}.jpg", i + 1))
         } else {
             Path::new(&output).to_path_buf()
         };

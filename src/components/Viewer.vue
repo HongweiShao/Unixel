@@ -406,7 +406,7 @@ async function onExportJpeg() {
         <div class="modal-row">
           <span class="modal-label">范围</span>
           <label class="radio"><input type="radio" value="current" v-model="exportScope" /> 当前帧</label>
-          <label class="radio"><input type="radio" value="all" v-model="exportScope" /> 所有{{ isMultiframe ? "帧" : "切片" }}</label>
+          <label class="radio"><input type="radio" value="all" v-model="exportScope" /> 整个序列（多帧/多切片）</label>
         </div>
 
         <div class="modal-row">
