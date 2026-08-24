@@ -22,8 +22,16 @@ dicom-object = "0.7"
 dicom-pixeldata = "0.7"
 dicom-dictionary-std = "0.7"
 dicom-core = "0.7"
+# 传输语法注册表 + 编码 trait（用于按显式 VR 小端编码器写出 HTJ2K 等未注册压缩语法）
+dicom-transfer-syntax-registry = "0.7"
+dicom-encoding = "0.7"
 # 常规图像与导出
 image = { version = "0.25", features = ["png", "jpeg", "tiff"] }
+# JPEG 解码器（支持无损 SOF3，用于 export_dicom_tests 中校验无损 JPEG 往返）
+jpeg-decoder = "0.3"
+# JPEG-LS 无损 / 近无损编码（纯 Rust，无 C/C++ FFI）：DICOM TS 1.2.840.10008.1.2.4.80（无损）/ .81（近无损）。
+# 保留原始位深（8/16bit），优于旧 JPEG 8bit 窗映射方案。
+pure_jpegls = "2.0"
 # 文字叠加（四角 DICOM 标签 + 居中斜向半透明水印），依赖 ab_glyph 加载 CJK 字体
 imageproc = "0.25"
 ab_glyph = "0.2"
@@ -31,6 +39,15 @@ ab_glyph = "0.2"
 nifti = { version = "0.11", features = ["ndarray_volumes"] }
 # HTJ2K（纯 Rust 移植 OpenJPH，无 C/C++ FFI）：无损 TS 201 / 有损 TS 203
 openjph-core = "0.1"
+# 导出 DICOM 封装像素所需的 smallvec（dicom-core 已传递依赖，此处显式声明以直接 use）
+smallvec = "1"
+# 导出 DICOM：脱敏加密与 UID 重生成
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+rand = "0.8"
 # 文件选择对话框
 tauri-plugin-dialog = "2"
 

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use dicom_pixeldata::PixelDecoder;
+use dicom_pixeldata::{ConvertOptions, ModalityLutOption, PixelDecoder, PixelRepresentation};
 use serde::{Serialize, Deserialize};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,21 @@ use image::GenericImageView;
 use image::RgbaImage;
 use imageproc::drawing::{draw_text_mut, text_size};
 use ab_glyph::{FontRef, PxScale};
-use dicom_object::{FileDicomObject, InMemDicomObject};
+use dicom_object::{mem::InMemElement, FileDicomObject, InMemDicomObject};
+use dicom_core::{PrimitiveValue, VR};
+use dicom_core::value::{InMemFragment, PixelFragmentSequence, Value};
+use dicom_core::value::fragments::Fragments;
+// 传输语法注册表：用于显式以「显式 VR 小端」编码器写出 HTJ2K 等库未注册的压缩传输语法
+use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+use pbkdf2::pbkdf2 as pbkdf2_derive;
+use sha2::Sha256;
+use hmac::Hmac;
+use md5::{Digest, Md5};
+use rand::Rng;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2046,6 +2060,862 @@ mod tests {
     }
 }
 
+// ============ 导出 DICOM ============
+//
+// 设计要点（与用户确认的需求）：
+// - 像素来源：保留原始像素（不套窗宽窗位、不改诊断内容）。CT 通过保留 Rescale 标签
+//   维持 HU 映射；脱敏仅改元数据。
+// - 传输语法：未压缩（Implicit/Explicit VR LE）、RLE Lossless、HTJ2K（TS201 无损 /
+//   TS203 有损）、JPEG-LS（TS 1.2.840.10008.1.2.4.80 无损 / .81 近无损；保留原始位深
+//   与符号性，优于旧 JPEG 8-bit 窗映射方案）。
+// - 脱敏粒度：每范围独立选 处理方式（keep/delete/hash/encrypt/regenerate）。
+//   加密：PBKDF2-HMAC-SHA256(密码,盐)→AES-256-GCM；盐与算法标识写入私有标签，
+//   密码不入库（留空则默认 "unixel"）；密文映射以 JSON 存于私有标签。
+// - 标识：仅 SoftwareVersions (0018,1020) = "Unixel - Hongwei Shao"（后台自动写入，前端无对应 UI）。
+// - 整个序列：「输出形式」可选 单个文件（多帧，合并） / 多个文件（单帧）。
+// - HTJ2K 有损程度：openjph-core 0.1.0 无公开 rate/quality API，故映射到 DWT 分解层数(1..6)。
+
+const TS_IMPLICIT: &str = "1.2.840.10008.1.2";
+const TS_EXPLICIT: &str = "1.2.840.10008.1.2.1";
+const TS_RLE: &str = "1.2.840.10008.1.2.5";
+// 注：以下 UID 为用户指定值（HTJ2K 无损=200 / 有损=201）。官方 DICOM 注册表为
+// HTJ2K 无损=1.2.840.10008.1.2.4.201、有损=1.2.840.10008.1.2.4.202；如要求严格对齐
+// 官方注册表，请将下面两行改为 201 / 202。
+const TS_HTJ2K_LOSSLESS: &str = "1.2.840.10008.1.2.4.200";
+const TS_HTJ2K_LOSSY: &str = "1.2.840.10008.1.2.4.201";
+// JPEG-LS：无损 TS 1.2.840.10008.1.2.4.80（NEAR=0）；近无损 TS 1.2.840.10008.1.2.4.81（NEAR>0）。
+// 由 pure_jpegls 输出 ITU-T T.87 标准流，保留原始位深（8/16-bit）与符号性，不套窗宽窗位。
+const TS_JPEGLS_LOSSLESS: &str = "1.2.840.10008.1.2.4.80";
+const TS_JPEGLS_LOSS: &str = "1.2.840.10008.1.2.4.81";
+// Multiframe Secondary Capture（合并多帧单文件时的 SOP 类，通用安全）
+const MF_SC_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7.4";
+
+// 脱敏范围分组（DICOM keyword）
+struct AnonGroup {
+    id: &'static str,
+    tags: &'static [&'static str],
+}
+const ANON_GROUPS: &[AnonGroup] = &[
+    AnonGroup {
+        id: "patient",
+        tags: &[
+            "PatientName",
+            "PatientID",
+            "PatientBirthDate",
+            "PatientSex",
+            "PatientAddress",
+            "PatientTelephoneNumbers",
+        ],
+    },
+    AnonGroup {
+        id: "institution",
+        tags: &["InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName"],
+    },
+    AnonGroup {
+        id: "personnel",
+        tags: &[
+            "ReferringPhysicianName",
+            "PerformingPhysicianName",
+            "OperatorsName",
+            "PhysiciansOfRecord",
+        ],
+    },
+    AnonGroup {
+        id: "device",
+        tags: &[
+            "Manufacturer",
+            "ManufacturerModelName",
+            "DeviceSerialNumber",
+            "StationName",
+        ],
+    },
+    AnonGroup {
+        id: "datetime",
+        tags: &[
+            "StudyDate",
+            "StudyTime",
+            "SeriesDate",
+            "SeriesTime",
+            "AcquisitionDate",
+            "AcquisitionTime",
+            "ContentDate",
+            "ContentTime",
+        ],
+    },
+    AnonGroup {
+        id: "uid",
+        tags: &["StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"],
+    },
+];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnonRangeArg {
+    id: String,
+    method: String, // keep | delete | hash | encrypt | regenerate
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportDicomArgs {
+    mode: String, // "current" | "all"
+    file_path: String,
+    series_paths: Vec<String>,
+    frame_index: u32,
+    transfer_syntax: String, // implicit|explicit|rle|htj2k_lossless|htj2k_lossy|jpegls_lossless|jpegls_loss
+    quality: u8,            // JPEG quality 1-100
+    wc: f64,
+    ww: f64,
+    anon_ranges: Vec<AnonRangeArg>,
+    password: String,
+    output: String,
+    multifile: bool,
+}
+
+// 源像素信息（用于重建 PixelData）
+struct PixelInfo {
+    bits_allocated: u16,
+    signed: bool,
+    samples: u16,
+    width: u32,
+    height: u32,
+}
+
+// ---- 工具 ----
+
+fn read_f64_attr(obj: &FileDicomObject<InMemDicomObject>, name: &str, default: f64) -> f64 {
+    obj.element_by_name(name)
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .and_then(|s| {
+            s.split('\\')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<f64>()
+                .ok()
+        })
+        .unwrap_or(default)
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    let h = Md5::digest(data);
+    h.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn to_hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn derive_key(pw: &str, salt: &[u8]) -> Vec<u8> {
+    let mut key = vec![0u8; 32];
+    pbkdf2_derive::<Hmac<Sha256>>(pw.as_bytes(), salt, 100_000, &mut key)
+        .expect("PBKDF2 派生失败（盐长度非法）");
+    key
+}
+
+fn aes_gcm_encrypt(key: &[u8], pt: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce);
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), pt)
+        .map_err(|e| e.to_string())?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+#[cfg(test)]
+fn aes_gcm_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
+    let (nonce, ct) = data.split_at(12);
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|e| e.to_string())
+}
+
+fn gen_uid() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill(&mut b);
+    format!("2.25.{}", u128::from_be_bytes(b))
+}
+
+fn set_tag(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, vr: VR, val: &str) {
+    obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
+}
+
+fn set_tag_str(obj: &mut FileDicomObject<InMemDicomObject>, kw: &str, val: &str) {
+    if let Some(el) = obj.element_by_name(kw).ok() {
+        let tag = el.tag();
+        let vr = el.vr();
+        obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
+    }
+}
+
+// ---- 像素提取（保留原始像素，不套 Modality LUT）----
+
+fn extract_native_frames(
+    obj: &FileDicomObject<InMemDicomObject>,
+) -> Result<(Vec<Vec<u8>>, PixelInfo), String> {
+    let pd = obj
+        .decode_pixel_data()
+        .map_err(|e| format!("解码像素数据失败: {}", e))?;
+    let width = pd.columns();
+    let height = pd.rows();
+    let samples = pd.samples_per_pixel();
+    let bits_allocated = pd.bits_allocated();
+    let signed = matches!(pd.pixel_representation(), PixelRepresentation::Signed);
+    let frames = pd.number_of_frames();
+    // 关键：ModalityLutOption::None 不套 Rescale，得到「原始存储像素值」，
+    // 与文件中保留的 RescaleSlope/Intercept 配合在读取端还原 HU。
+    let opts = ConvertOptions::new().with_modality_lut(ModalityLutOption::None);
+    let native: Vec<u8> = if bits_allocated <= 8 {
+        pd.to_vec_with_options::<u8>(&opts)
+            .map_err(|e| format!("像素解码失败: {}", e))?
+    } else if signed {
+        pd.to_vec_with_options::<i16>(&opts)
+            .map_err(|e| format!("像素解码失败: {}", e))?
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    } else {
+        pd.to_vec_with_options::<u16>(&opts)
+            .map_err(|e| format!("像素解码失败: {}", e))?
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect()
+    };
+    let bytes_per_sample = if bits_allocated <= 8 { 1u32 } else { 2u32 };
+    let frame_bytes = (width * height * samples as u32 * bytes_per_sample) as usize;
+    let mut out = Vec::with_capacity(frames as usize);
+    for f in 0..frames as usize {
+        let s = f * frame_bytes;
+        out.push(native[s..s + frame_bytes].to_vec());
+    }
+    Ok((
+        out,
+        PixelInfo {
+            bits_allocated,
+            signed,
+            samples,
+            width,
+            height,
+        },
+    ))
+}
+
+fn load_source_for_export(
+    path: &str,
+) -> Result<(FileDicomObject<InMemDicomObject>, Vec<Vec<u8>>, PixelInfo), String> {
+    let lower = path.to_lowercase();
+    if !(lower.ends_with(".dcm") || lower.ends_with(".dicom")) {
+        return Err("导出 DICOM 仅支持 DICOM 源文件（.dcm / .dicom）".into());
+    }
+    let obj = dicom_object::open_file(path).map_err(|e| format!("打开文件失败: {}", e))?;
+    let (frames, info) = extract_native_frames(&obj)?;
+    Ok((obj, frames, info))
+}
+
+// ---- DICOM RLE（PackBits 风格，逐扫描行）----
+
+fn rle_encode_frame(frame: &[u8], row_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    if row_bytes == 0 {
+        return out;
+    }
+    for row in frame.chunks(row_bytes) {
+        let n = row.len();
+        let mut i = 0usize;
+        while i < n {
+            // 相同字节游程
+            let mut run = 1;
+            while i + run < n && row[i + run] == row[i] && run < 128 {
+                run += 1;
+            }
+            if run >= 2 {
+                let cnt = run.min(128);
+                out.push((257 - cnt) as u8); // 重复运行头（129..255）
+                out.push(row[i]);
+                i += cnt;
+            } else {
+                // 字面量运行
+                let mut cnt = 0usize;
+                while i + cnt < n && cnt < 128 {
+                    if i + cnt + 1 < n && row[i + cnt] == row[i + cnt + 1] {
+                        break; // 出现重复对，交还给重复分支
+                    }
+                    cnt += 1;
+                }
+                if cnt == 0 {
+                    cnt = 1;
+                }
+                out.push((cnt - 1) as u8); // 字面量头（0..127）
+                out.extend_from_slice(&row[i..i + cnt]);
+                i += cnt;
+            }
+        }
+    }
+    out
+}
+
+// ---- HTJ2K（复用 openjph-core，支持 8/16-bit 有/无符号）----
+
+fn htj2k_encode_frame(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: u16,
+    signed: bool,
+    lossless: bool,
+    degree: u8,
+) -> Result<Vec<u8>, String> {
+    use openjph_core::codestream::Codestream;
+    use openjph_core::file::MemOutfile;
+    use openjph_core::types::{Point, Size};
+    let mut cs = Codestream::new();
+    cs.access_siz_mut()
+        .set_image_extent(Point::new(width, height));
+    cs.access_siz_mut().set_num_components(1);
+    cs.access_siz_mut()
+        .set_comp_info(0, Point::new(1, 1), bit_depth as u32, signed);
+    cs.access_siz_mut()
+        .set_tile_size(Size::new(width, height));
+    {
+        // 有损程度：openjph-core 0.1.0 无 rate/quality API，映射到 DWT 分解层数(1..6)
+        let levels = (((degree as u32).clamp(10, 100) * 5 / 100) + 1).clamp(1, 6);
+        let cod = cs.access_cod_mut();
+        cod.set_num_decomposition(levels);
+        cod.set_reversible(lossless);
+        cod.set_color_transform(false);
+    }
+    cs.set_planar(0);
+    let mut outfile = MemOutfile::new();
+    cs.write_headers(&mut outfile, &[])
+        .map_err(|e| format!("HTJ2K 写头失败: {}", e))?;
+    let bytes_per = if bit_depth <= 8 { 1usize } else { 2usize };
+    let mut i = 0usize;
+    for _ in 0..height as usize {
+        let mut line: Vec<i32> = Vec::with_capacity(width as usize);
+        for _ in 0..width as usize {
+            let v = if bytes_per == 1 {
+                frame[i] as i32
+            } else {
+                let lo = frame[i];
+                let hi = frame[i + 1];
+                if signed {
+                    i16::from_le_bytes([lo, hi]) as i32
+                } else {
+                    u16::from_le_bytes([lo, hi]) as i32
+                }
+            };
+            i += bytes_per;
+            line.push(v);
+        }
+        cs.exchange(&line, 0)
+            .map_err(|e| format!("HTJ2K 编码失败: {}", e))?;
+    }
+    cs.flush(&mut outfile)
+        .map_err(|e| format!("HTJ2K flush 失败: {}", e))?;
+    Ok(outfile.get_data().to_vec())
+}
+
+// ---- JPEG-LS（保留原始位深，pure_jpegls 输出 ITU-T T.87 标准流）----
+//
+// DICOM 传输语法：
+//   - 1.2.840.10008.1.2.4.80 (JPEG-LS Lossless)        → near = 0
+//   - 1.2.840.10008.1.2.4.81 (JPEG-LS Near-Lossless)   → near > 0（最大重建误差 ±near）
+// 关键：不做窗映射，直接压缩原始存储像素（含 16-bit 有符号 HU），保留诊断信息；
+// 显式指定 precision = bits_allocated，确保解码端按相同位深/符号性还原。
+
+/// 将单帧原始像素编码为 JPEG-LS 比特流。
+/// `near = 0` 无损（TS .80）；`near > 0` 近无损（TS .81，最大误差 ±near）。
+/// 源字节按 bits_allocated 重组为 u16（有符号 int16 按位 reinterpret 保留位模式），
+/// 并显式传入 precision，避免 pure_jpegls 自动推导精度导致 16-bit 有符号数据被截断。
+fn jpegls_encode_frame(
+    frame: &[u8],
+    info: &PixelInfo,
+    near: u8,
+) -> Result<Vec<u8>, String> {
+    use jpegls::{encode_with_options, EncodeOptions, Profile};
+
+    let w = info.width as usize;
+    let h = info.height as usize;
+    let per = w * h;
+    let bytes_per = if info.bits_allocated <= 8 { 1usize } else { 2usize };
+    if frame.len() < per * bytes_per {
+        return Err("JPEG-LS：像素数据长度不足".into());
+    }
+
+    // 重组为 u16 序列（保留位模式；有符号按位 reinterpret，解码端用相同 signedness 还原）
+    let mut samples: Vec<u16> = Vec::with_capacity(per);
+    if bytes_per == 1 {
+        for i in 0..per {
+            samples.push(frame[i] as u16);
+        }
+    } else if info.signed {
+        for i in (0..per * 2).step_by(2) {
+            samples.push(i16::from_le_bytes([frame[i], frame[i + 1]]) as u16);
+        }
+    } else {
+        for i in (0..per * 2).step_by(2) {
+            samples.push(u16::from_le_bytes([frame[i], frame[i + 1]]));
+        }
+    }
+
+    let precision = info.bits_allocated as u8; // 8 或 16，显式指定
+    let mut opts = EncodeOptions::default();
+    opts.near = near;
+    opts.profile = Profile::T87;
+    opts.precision = Some(precision);
+    let mut out = Vec::new();
+    encode_with_options(&samples, info.width, info.height, &opts, &mut out)
+        .map_err(|e| format!("JPEG-LS 编码失败: {}", e))?;
+    Ok(out)
+}
+
+/// 将多帧封装为 PixelData 的 JPEG-LS 片段序列（每帧一个 fragment）。
+fn encode_jpegls_frames(
+    frames: &[Vec<u8>],
+    info: &PixelInfo,
+    near: u8,
+) -> Result<InMemElement, String> {
+    let mut frags: Vec<Fragments> = Vec::with_capacity(frames.len());
+    for f in frames {
+        let bytes = jpegls_encode_frame(f, info, near)?;
+        frags.push(Fragments::new(bytes, 0));
+    }
+    let pfs: PixelFragmentSequence<InMemFragment> = frags.into();
+    Ok(InMemElement::new(
+        Tag(0x7FE0, 0x0010),
+        VR::OB,
+        Value::PixelSequence(pfs),
+    ))
+}
+
+// ---- 像素载荷构建 ----
+
+fn encode_htj2k_frames(
+    frames: &[Vec<u8>],
+    info: &PixelInfo,
+    lossless: bool,
+    degree: u8,
+) -> Result<InMemElement, String> {
+    let mut frags: Vec<Fragments> = Vec::with_capacity(frames.len());
+    for f in frames {
+        let bytes = htj2k_encode_frame(
+            f,
+            info.width,
+            info.height,
+            info.bits_allocated,
+            info.signed,
+            lossless,
+            degree,
+        )?;
+        frags.push(Fragments::new(bytes, 0));
+    }
+    let pfs: PixelFragmentSequence<InMemFragment> = frags.into();
+    Ok(InMemElement::new(
+        Tag(0x7FE0, 0x0010),
+        VR::OB,
+        Value::PixelSequence(pfs),
+    ))
+}
+
+fn build_pixel_payload(
+    ts_arg: &str,
+    frames: &[Vec<u8>],
+    info: &PixelInfo,
+    degree: u8,
+    near: u8,
+) -> Result<InMemElement, String> {
+    match ts_arg {
+        "implicit" | "explicit" => {
+            let mut all = Vec::new();
+            for f in frames {
+                all.extend_from_slice(f);
+            }
+            let vr = if info.bits_allocated <= 8 {
+                VR::OB
+            } else {
+                VR::OW
+            };
+            Ok(InMemElement::new(
+                Tag(0x7FE0, 0x0010),
+                vr,
+                Value::Primitive(PrimitiveValue::from(all)),
+            ))
+        }
+        "rle" => {
+            let row_bytes = (info.width
+                * info.samples as u32
+                * (if info.bits_allocated <= 8 { 1 } else { 2 }))
+                as usize;
+            let frags: Vec<Fragments> = frames
+                .iter()
+                .map(|f| Fragments::new(rle_encode_frame(f, row_bytes), 0))
+                .collect();
+            let pfs: PixelFragmentSequence<InMemFragment> = frags.into();
+            Ok(InMemElement::new(
+                Tag(0x7FE0, 0x0010),
+                VR::OB,
+                Value::PixelSequence(pfs),
+            ))
+        }
+        "htj2k_lossless" => encode_htj2k_frames(frames, info, true, degree),
+        "htj2k_lossy" => encode_htj2k_frames(frames, info, false, degree),
+        "jpegls_lossless" => encode_jpegls_frames(frames, info, 0),
+        "jpegls_loss" => encode_jpegls_frames(frames, info, near),
+        _ => Err(format!("不支持的传输语法: {}", ts_arg)),
+    }
+}
+
+// ---- 脱敏 ----
+
+fn anonymize_object(
+    obj: &mut FileDicomObject<InMemDicomObject>,
+    ranges: &[AnonRangeArg],
+    password: &str,
+    regenerate_study_series: bool,
+) -> Result<(), String> {
+    let need_encrypt = ranges.iter().any(|r| r.method == "encrypt");
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill(&mut salt);
+    // 密码可选：留空时使用默认口令 "unixel"（不入库）
+    let pw = if password.is_empty() { "unixel" } else { password };
+    let key = if need_encrypt {
+        derive_key(pw, &salt)
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    for group in ANON_GROUPS {
+        let method = match ranges.iter().find(|r| r.id == group.id) {
+            Some(r) => r.method.as_str(),
+            None => "keep",
+        };
+        if method == "keep" {
+            continue;
+        }
+
+        // UID 组特殊处理：重新生成随机 UID
+        if group.id == "uid" && method == "regenerate" {
+            if regenerate_study_series {
+                set_tag_str(obj, "StudyInstanceUID", &gen_uid());
+                set_tag_str(obj, "SeriesInstanceUID", &gen_uid());
+            }
+            set_tag_str(obj, "SOPInstanceUID", &gen_uid());
+            let new_sop = obj
+                .element_by_name("SOPInstanceUID")
+                .ok()
+                .and_then(|e| e.to_str().ok())
+                .unwrap_or_default();
+            obj.meta_mut().media_storage_sop_instance_uid = new_sop.to_string();
+            continue;
+        }
+
+        for &kw in group.tags {
+            let cur = match obj
+                .element_by_name(kw)
+                .ok()
+                .and_then(|e| e.to_str().ok())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            match method {
+                "delete" => {
+                    obj.remove_element_by_name(kw).ok();
+                }
+                "hash" => {
+                    let h = md5_hex(cur.as_bytes());
+                    set_tag_str(obj, kw, &h);
+                }
+                "encrypt" => {
+                    let ct = aes_gcm_encrypt(&key, cur.as_bytes())?;
+                    let t = obj
+                        .element_by_name(kw)
+                        .ok()
+                        .map(|e| e.tag())
+                        .unwrap_or(Tag(0, 0));
+                    let tag_str = format!("({:04X},{:04X})", t.group(), t.element());
+                    entries.push(serde_json::json!({
+                        "tag": tag_str,
+                        "kw": kw,
+                        "ct_hex": to_hex(&ct),
+                    }));
+                    set_tag_str(obj, kw, "ANONYMIZED-ENCRYPTED");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !entries.is_empty() {
+        let mapping = serde_json::json!({
+            "algo": "PBKDF2-HMAC-SHA256;AES-256-GCM",
+            "iterations": 100000,
+            "salt_hex": to_hex(&salt),
+            "entries": entries,
+        });
+        let json = serde_json::to_vec(&mapping).map_err(|e| format!("加密映射序列化失败: {}", e))?;
+        obj.put_private_element(
+            0x0099,
+            "UNIXEL",
+            0x01,
+            VR::LO,
+            PrimitiveValue::from("PBKDF2-HMAC-SHA256;AES-256-GCM"),
+        )
+        .map_err(|e| e.to_string())?;
+        obj.put_private_element(
+            0x0099,
+            "UNIXEL",
+            0x02,
+            VR::LO,
+            PrimitiveValue::from(to_hex(&salt)),
+        )
+        .map_err(|e| e.to_string())?;
+        obj.put_private_element(0x0099, "UNIXEL", 0x03, VR::OB, PrimitiveValue::from(json))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ---- 单文件写出 ----
+
+#[allow(clippy::too_many_arguments)]
+fn write_one_dicom(
+    obj: &mut FileDicomObject<InMemDicomObject>,
+    frames: &[Vec<u8>],
+    info: &PixelInfo,
+    ts_arg: &str,
+    ts_uid: &str,
+    _compressed: bool,
+    _slope: f64,
+    _intercept: f64,
+    _wc: f64,
+    _ww: f64,
+    _invert: bool,
+    quality: u8,
+    near: u8,
+    is_merged: bool,
+    ranges: &[AnonRangeArg],
+    password: &str,
+    path: &str,
+) -> Result<(), String> {
+    // 传输语法
+    obj.meta_mut().transfer_syntax = ts_uid.to_string();
+    obj.meta_mut().update_information_group_length();
+
+    // 像素数据
+    let payload: InMemElement = if ts_arg == "jpegls_lossless" || ts_arg == "jpegls_loss" {
+        // JPEG-LS：保留原始位深与符号性（不套窗宽窗位、不改 BitsAllocated 等）。
+        // near: 0=无损(TS .80)，>0=近无损(TS .81)。
+        encode_jpegls_frames(frames, info, if ts_arg == "jpegls_lossless" { 0 } else { near })?
+    } else {
+        build_pixel_payload(ts_arg, frames, info, quality, near)?
+    };
+    obj.put(payload);
+    // 帧数（压缩/解压/抽取后可能与原值不同）
+    obj.put(InMemElement::new(
+        Tag(0x0028, 0x0008),
+        VR::IS,
+        PrimitiveValue::from(frames.len().to_string()),
+    ));
+
+    // 合并多帧：改为 Multiframe Secondary Capture SOP 类
+    if is_merged {
+        set_tag(obj, Tag(0x0008, 0x0016), VR::UI, MF_SC_SOP_CLASS);
+        obj.meta_mut().media_storage_sop_class_uid = MF_SC_SOP_CLASS.to_string();
+    }
+
+    // 软件标识
+    set_tag(obj, Tag(0x0018, 0x1020), VR::LO, "Unixel - Hongwei Shao");
+
+    // 脱敏
+    anonymize_object(obj, ranges, password, is_merged)?;
+
+    // 数据集字节编码器选择（此处的 TS 仅决定「除 PixelData 外各 DICOM 元素的字节编码方式」，
+    // 并不替代文件声明的传输语法）：
+    // - 隐式 VR 小端（implicit）→ TS_IMPLICIT。
+    // - 其余（未压缩 explicit 与所有压缩语法 RLE/HTJ2K/JPEG）→ TS_EXPLICIT（显式 VR 小端）。
+    //   依据 DICOM PS3.5：所有压缩传输语法的数据集一律以「显式 VR 小端」编码，仅 PixelData
+    //   按文件声明的传输语法压缩。dicom-rs 注册表未含 HTJ2K 等压缩语法的编码器，故数据集序列化
+    //   只能使用 TS_EXPLICIT（其字节与标准一致）；文件真正声明的压缩方式由 obj.meta 的
+    //   transfer_syntax（= 上方 ts_uid，已写入元信息）决定。
+    let dataset_ts_uid = if ts_arg == "implicit" {
+        TS_IMPLICIT
+    } else {
+        TS_EXPLICIT
+    };
+    let dataset_ts = TransferSyntaxRegistry
+        .get(dataset_ts_uid)
+        .ok_or_else(|| format!("未知数据集编码传输语法: {}", dataset_ts_uid))?;
+
+    let file = File::create(path).map_err(|e| format!("创建文件失败: {}", e))?;
+    let mut to = BufWriter::new(file);
+    to.write_all(&[0u8; 128])
+        .map_err(|e| format!("写入前导区失败: {}", e))?;
+    to.write_all(b"DICM")
+        .map_err(|e| format!("写入魔数失败: {}", e))?;
+    obj.write_meta(&mut to)
+        .map_err(|e| format!("写入 DICOM 失败: {}", e))?;
+    obj.write_dataset_with_ts(&mut to, dataset_ts)
+        .map_err(|e| format!("写入 DICOM 失败: {}", e))
+}
+
+// ---- 命令入口 ----
+
+#[tauri::command]
+fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
+    let ts_arg = args.transfer_syntax.as_str();
+    let ts_uid = match ts_arg {
+        "implicit" => TS_IMPLICIT,
+        "explicit" => TS_EXPLICIT,
+        "rle" => TS_RLE,
+        "htj2k_lossless" => TS_HTJ2K_LOSSLESS,
+        "htj2k_lossy" => TS_HTJ2K_LOSSY,
+        "jpegls_lossless" => TS_JPEGLS_LOSSLESS,
+        "jpegls_loss" => TS_JPEGLS_LOSS,
+        _ => return Err(format!("不支持的传输语法: {}", args.transfer_syntax)),
+    };
+    let compressed = matches!(
+        ts_arg,
+        "rle" | "htj2k_lossless" | "htj2k_lossy" | "jpegls_lossless" | "jpegls_loss"
+    );
+    // JPEG-LS 近无损 NEAR（误差带 ±near），仅 jpegls_loss 使用；由前端有损程度映射
+    let near = if ts_arg == "jpegls_loss" {
+        args.quality.clamp(1, 255)
+    } else {
+        0
+    };
+
+    // 收集源
+    let mut sources: Vec<(FileDicomObject<InMemDicomObject>, Vec<Vec<u8>>, PixelInfo)> =
+        Vec::new();
+    if args.mode == "all" && !args.series_paths.is_empty() {
+        for p in &args.series_paths {
+            sources.push(load_source_for_export(p)?);
+        }
+    } else {
+        sources.push(load_source_for_export(&args.file_path)?);
+    }
+    if sources.is_empty() {
+        return Err("没有可导出的帧".into());
+    }
+
+    // 窗口参数（JPEG 用）：取第一个源
+    let (sop0, inter0) = {
+        let o = &sources[0].0;
+        (
+            read_f64_attr(o, "RescaleSlope", 1.0),
+            read_f64_attr(o, "RescaleIntercept", 0.0),
+        )
+    };
+    let phot0 = sources[0]
+        .0
+        .element_by_name("PhotometricInterpretation")
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("MONOCHROME2"));
+    let invert = phot0 == "MONOCHROME1";
+
+    let mut written = 0usize;
+
+    if args.mode == "current" {
+        let (obj, frames, info) = &sources[0];
+        let idx = (args.frame_index as usize).min(frames.len().saturating_sub(1));
+        let single = vec![frames[idx].clone()];
+        let mut o = obj.clone();
+        write_one_dicom(
+            &mut o,
+            &single,
+            info,
+            ts_arg,
+            ts_uid,
+            compressed,
+            sop0,
+            inter0,
+            args.wc,
+            args.ww,
+            invert,
+            args.quality,
+            near,
+            false,
+            &args.anon_ranges,
+            &args.password,
+            &args.output,
+        )?;
+        written += 1;
+    } else if args.multifile {
+        // 每帧单文件
+        std::fs::create_dir_all(&args.output).map_err(|e| format!("创建目录失败: {}", e))?;
+        let mut fi = 0usize;
+        for (obj, frames, info) in &sources {
+            for f in frames {
+                let mut o = obj.clone();
+                let single = vec![f.clone()];
+                let path = Path::new(&args.output).join(format!("frame_{:03}.dcm", fi + 1));
+                write_one_dicom(
+                    &mut o,
+                    &single,
+                    info,
+                    ts_arg,
+                    ts_uid,
+                    compressed,
+                    sop0,
+                    inter0,
+                args.wc,
+                args.ww,
+                invert,
+                args.quality,
+                near,
+                false,
+                &args.anon_ranges,
+                &args.password,
+                &path.to_string_lossy(),
+            )?;
+            written += 1;
+            fi += 1;
+            }
+        }
+    } else {
+        // 整个序列合并为单文件多帧
+        let (base_obj, _, base_info) = &sources[0];
+        let mut o = base_obj.clone();
+        let mut all_frames: Vec<Vec<u8>> = Vec::new();
+        let info = base_info;
+        for (_, frames, _) in &sources {
+            for f in frames {
+                all_frames.push(f.clone());
+            }
+        }
+        write_one_dicom(
+            &mut o,
+            &all_frames,
+            &info,
+            ts_arg,
+            ts_uid,
+            compressed,
+            sop0,
+            inter0,
+            args.wc,
+            args.ww,
+            invert,
+            args.quality,
+            near,
+            true,
+            &args.anon_ranges,
+            &args.password,
+            &args.output,
+        )?;
+        written += 1;
+    }
+
+    Ok(format!("已导出 {} 个 DICOM 文件", written))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2062,8 +2932,199 @@ pub fn run() {
             file_series_info,
             export_tags,
             scan_folder_series,
-            load_series_files
+            load_series_files,
+            export_dicom
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ============ 导出 DICOM 单元测试 ============
+
+#[cfg(test)]
+mod export_dicom_tests {
+    use super::*;
+
+    #[test]
+    fn md5_known_vector() {
+        assert_eq!(
+            md5_hex(b"abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
+    }
+
+    #[test]
+    fn aes_gcm_roundtrip() {
+        let key = derive_key("secret", b"0123456789abcdef");
+        let pt = b"Patient^Zhang";
+        let ct = aes_gcm_encrypt(&key, pt).expect("encrypt");
+        assert_ne!(ct.len(), pt.len()); // 含 12 字节 nonce
+        let dec = aes_gcm_decrypt(&key, &ct).expect("decrypt");
+        assert_eq!(dec, pt);
+    }
+
+    #[test]
+    fn uid_format() {
+        let u = gen_uid();
+        assert!(u.starts_with("2.25."));
+        assert!(u.len() < 64);
+    }
+
+    // DICOM RLE 解码（与编码器配对，验证往返一致）
+    fn rle_decode(data: &[u8], expected_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(expected_len);
+        let mut i = 0usize;
+        while i < data.len() && out.len() < expected_len {
+            let h = data[i];
+            i += 1;
+            if h < 128 {
+                let cnt = (h + 1) as usize;
+                out.extend_from_slice(&data[i..i + cnt]);
+                i += cnt;
+            } else {
+                let cnt = (257 - h as usize) as usize;
+                let b = data[i];
+                i += 1;
+                for _ in 0..cnt {
+                    out.push(b);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rle_roundtrip() {
+        // 构造测试帧：含长重复段与随机段
+        let mut frame = vec![0u8; 100];
+        for (k, b) in frame.iter_mut().enumerate() {
+            *b = if k < 40 { 7u8 } else { (k % 251) as u8 };
+        }
+        let enc = rle_encode_frame(&frame, 100);
+        assert!(!enc.contains(&128)); // 头字节不应出现保留值 128
+        let dec = rle_decode(&enc, frame.len());
+        assert_eq!(dec, frame);
+    }
+
+    #[test]
+    fn htj2k_8bit_roundtrip() {
+        // 8-bit 灰度帧，验证 HTJ2K 编码路径（经现有 htj2k_decode 解码回 8bit）
+        let w = 32u32;
+        let h = 24u32;
+        let mut frame = vec![0u8; (w * h) as usize];
+        for (k, b) in frame.iter_mut().enumerate() {
+            *b = ((k * 7) % 256) as u8;
+        }
+        let enc = htj2k_encode_frame(&frame, w, h, 8, false, true, 90).expect("htj2k encode");
+        assert!(!enc.is_empty());
+        let (dw, dh, gray) = htj2k_decode(&enc).expect("htj2k decode");
+        assert_eq!(dw, w);
+        assert_eq!(dh, h);
+        assert_eq!(gray, frame);
+    }
+
+    #[test]
+    fn build_pixel_native_concat() {
+        // 未压缩：两帧拼接后应得到原始字节拼接
+        let info = PixelInfo {
+            bits_allocated: 16,
+            signed: false,
+            samples: 1,
+            width: 2,
+            height: 2,
+        };
+        let f1 = vec![1u8, 0, 2, 0, 3, 0, 4, 0];
+        let f2 = vec![5u8, 0, 6, 0, 7, 0, 8, 0];
+        let payload = build_pixel_payload("explicit", &[f1.clone(), f2.clone()], &info, 90, 0).unwrap();
+        assert_eq!(payload.vr(), VR::OW);
+        match payload.value() {
+            Value::Primitive(pv) => {
+                let b = pv.to_bytes();
+                let mut expect = f1;
+                expect.extend_from_slice(&f2);
+                assert_eq!(b.as_ref(), expect.as_slice());
+            }
+            _ => panic!("未压缩像素应为 Primitive"),
+        }
+    }
+
+    #[test]
+    fn jpegls_lossless_roundtrip_8bit() {
+        use jpegls::{decode, encode_with_options, EncodeOptions, Profile};
+        // 构造 8-bit 灰度测试图（含 0、255 与中间值，触发各类残差/游程）
+        let w = 8u32;
+        let h = 6u32;
+        let mut samples: Vec<u16> = vec![0u16; (w * h) as usize];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                samples[y * w as usize + x] =
+                    (((y * w as usize + x) * 37 + 11) % 256) as u16;
+            }
+        }
+        let mut opts = EncodeOptions::default();
+        opts.near = 0;
+        opts.profile = Profile::T87;
+        opts.precision = Some(8);
+        let mut buf = Vec::new();
+        encode_with_options(&samples, w, h, &opts, &mut buf).unwrap();
+        assert_eq!(&buf[0..2], &[0xFF, 0xD8]);
+        // jpegls 解码自身输出应逐像素无损还原
+        let (dec, dw, dh) = decode(&buf, w, h).expect("JPEG-LS 解码失败");
+        assert_eq!(dw, w);
+        assert_eq!(dh, h);
+        assert_eq!(dec, samples, "8-bit JPEG-LS 无损往返不一致");
+    }
+
+    #[test]
+    fn jpegls_lossless_roundtrip_16bit_signed() {
+        use jpegls::decode;
+        // 构造 16-bit 有符号（int16）测试像素，按位 reinterpret 为 u16 后编码
+        let w = 8u32;
+        let h = 6u32;
+        let raw: Vec<i16> = (0..(w * h) as i32)
+            .map(|i| ((i * 131 - 4000) % 32000) as i16)
+            .collect();
+        let mut frame: Vec<u8> = Vec::with_capacity(raw.len() * 2);
+        for v in &raw {
+            frame.extend_from_slice(&v.to_le_bytes());
+        }
+        let info = PixelInfo {
+            bits_allocated: 16,
+            signed: true,
+            samples: 1,
+            width: w,
+            height: h,
+        };
+        let bytes = jpegls_encode_frame(&frame, &info, 0).unwrap();
+        assert_eq!(&bytes[0..2], &[0xFF, 0xD8]);
+        // 将 raw 按位 reinterpret 为 u16 序列，与解码结果对比
+        let samples: Vec<u16> = raw.iter().map(|&v| v as u16).collect();
+        let (dec, dw, dh) = decode(&bytes, w, h).expect("JPEG-LS 16-bit 解码失败");
+        assert_eq!(dw, w);
+        assert_eq!(dh, h);
+        assert_eq!(dec, samples, "16-bit 有符号 JPEG-LS 无损往返不一致");
+    }
+
+    #[test]
+    fn jpegls_near_lossless_16bit() {
+        use jpegls::{decode, encode_with_options, EncodeOptions, Profile};
+        // 近无损：near=3，重建误差应 ≤ 3；同时验证压缩确实发生（体积小于原始）
+        let w = 32u32;
+        let h = 24u32;
+        let samples: Vec<u16> = (0..(w * h) as u32)
+            .map(|i| (i * 911 % 4096) as u16)
+            .collect();
+        let mut opts = EncodeOptions::default();
+        opts.near = 3;
+        opts.profile = Profile::T87;
+        opts.precision = Some(12);
+        let mut buf = Vec::new();
+        encode_with_options(&samples, w, h, &opts, &mut buf).unwrap();
+        let (dec, _, _) = decode(&buf, w, h).expect("JPEG-LS 近无损解码失败");
+        assert_eq!(dec.len(), samples.len());
+        for (a, b) in samples.iter().zip(dec.iter()) {
+            let diff = (*a as i32 - *b as i32).abs();
+            assert!(diff <= 3, "近无损误差 {} 超出 NEAR=3", diff);
+        }
+    }
 }
