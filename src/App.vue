@@ -777,7 +777,6 @@ onMounted(async () => {
     <!-- 详情对话框 -->
     <div v-if="detailsOpen" class="modal-mask" @click.self="detailsOpen = false">
         <div class="modal details">
-          <button class="modal-close-x" @click="detailsOpen = false" aria-label="关闭">×</button>
           <div class="details-head">
             <h2>文件标签信息</h2>
             <span class="details-file">{{ detailsTags?.filename }}</span>
@@ -794,6 +793,7 @@ onMounted(async () => {
               class="details-search"
               placeholder="搜索标签 / 关键字 / 值…"
             />
+            <button class="modal-close-x" type="button" @click="detailsOpen = false" aria-label="关闭">&times;</button>
           </div>
         <div class="details-body">
           <div
@@ -1135,17 +1135,21 @@ main {
   padding: 0;
   position: relative;
 }
+/* 标题栏：与导出对话框 .modal-title 风格一致（底色比内容区 --panel 略深一档，低对比区分） */
 .details-head {
   display: flex;
   align-items: center;
   gap: 12px;
-  /* 右侧预留空间，避免搜索框压到右上角关闭叉 */
-  padding: 14px 44px 14px 18px;
+  padding: 12px 20px;
+  background: var(--titlebar-bg, var(--bg-2, #1c1f26));
   border-bottom: 1px solid var(--border);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
 }
 .details-head h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: 15px;
+  font-weight: 600;
 }
 .details-file {
   font-size: 12px;
@@ -1164,24 +1168,21 @@ main {
   font-size: 12px;
   width: 180px;
 }
-/* 右上角关闭叉 */
+/* 标题栏关闭叉（与导出对话框 .modal-close 风格一致） */
 .modal-close-x {
-  position: absolute;
-  top: 8px;
-  right: 10px;
-  width: 26px;
-  height: 26px;
-  border: none;
+  flex: none;
   background: transparent;
+  border: none;
   color: var(--fg-dim);
-  font-size: 20px;
+  font-size: 18px;
   line-height: 1;
-  border-radius: 6px;
+  padding: 2px 7px;
+  border-radius: 4px;
   cursor: pointer;
-  z-index: 2;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 .modal-close-x:hover {
-  background: var(--bg);
+  background: rgba(127, 127, 127, 0.18);
   color: var(--fg);
 }
 /* 导出格式与按钮 */
@@ -1358,7 +1359,8 @@ main {
 .ss-head {
   display: flex;
   align-items: center;
-  padding: 14px 44px 14px 18px;
+  justify-content: space-between;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border);
 }
 .ss-head h2 {

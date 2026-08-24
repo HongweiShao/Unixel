@@ -23,3 +23,6 @@ data/CBCT/
 # 扫描/测试生成的报告（最终产物）
 data/*.json
 # 注意：data/*.py 扫描脚本不在此列，正常纳入版本管理
+
+# ===== 测试生成的产物（不入库） =====
+src-tauri/tests/*.nii.gz

@@ -345,6 +345,39 @@ const anonPassword = ref("");
 const exportingDicom = ref(false);
 const exportDicomMsg = ref<string | null>(null);
 
+// ===== 导出 NIfTI 状态 =====
+const exportNiftiOpen = ref(false);
+const exportNiftiScope = ref<"current" | "all">("all");
+// 数据类型选项（与后端 export_nifti_core 量化分支对齐）；默认 int16 直接存 HU 整数
+const niftiTypeOptions = [
+  { value: "int16", label: "int16（默认 · HU 整数 · 无损当 HU∈[-32768,32767]）" },
+  { value: "int32", label: "int32（HU 整数 · 范围大）" },
+  { value: "uint16", label: "uint16（偏移 +1024 · HU∈[-1024,64511]）" },
+  { value: "uint8", label: "uint8（线性映射到 0-255 · 强制有损）" },
+  { value: "float32", label: "float32（HU 浮点 · 无损 · 体积大）" },
+  { value: "float64", label: "float64（高精度 · 体积最大）" },
+] as const;
+const exportNiftiType = ref<string>("int16");
+const exportNiftiSform = ref(true); // 写入 sform（RAS 仿射）
+const exportNiftiGz = ref(true); // .nii.gz 压缩
+const exportingNifti = ref(false);
+const exportNiftiMsg = ref<string | null>(null);
+// 数据类型精度提示（整数类型越界 / uint8 强制有损）
+const niftiTypeHint = computed(() => {
+  switch (exportNiftiType.value) {
+    case "uint8":
+      return "uint8 为强制有损：HU 线性映射到 0-255 并裁剪，仅适合预览。";
+    case "int16":
+      return "int16 无损当 HU∈[-32768,32767]；超出将截断（后端会提示）。";
+    case "uint16":
+      return "uint16 需 +1024 偏移后再存；HU<-1024 或 >64511 将截断（后端会提示）。";
+    case "int32":
+      return "int32 范围大，基本无截断风险，但体积极大。";
+    default:
+      return "浮点类型无损保留 HU，但体积显著大于整数类型。";
+  }
+});
+
 // 传输语法选项（与后端 ExportDicomArgs.transferSyntax 对齐）
 const tsOptions = [
   { value: "explicit", label: "未压缩（显式 VR）" },
@@ -451,6 +484,48 @@ async function onExportDicom() {
     exportDicomOpen.value = false;
   }
 }
+
+async function onExportNifti() {
+  if (!isRealFile.value) return;
+
+  // 输出目标：按压缩选项给出 .nii.gz 或 .nii（后端 ensure_nii_ext 也会兜底修正扩展名）
+  const ext = exportNiftiGz.value ? "nii.gz" : "nii";
+  const base = props.meta.filename.replace(
+    /\.(dcm|dicom|nii(\.gz)?|j2c|jph|png|jpe?g|tif?f)$/i,
+    ""
+  );
+  const suggested = `${base}.${ext}`;
+  const output = await save({
+    defaultPath: suggested,
+    filters: [{ name: "NIfTI", extensions: [ext] }],
+  });
+  if (!output) return; // 用户取消
+
+  exportingNifti.value = true;
+  exportNiftiMsg.value = null;
+  try {
+    const res = await invoke<string>("export_nifti", {
+      args: {
+        mode: exportNiftiScope.value,
+        filePath: props.meta.path,
+        seriesPaths: props.seriesPaths ?? [],
+        frameIndex: frameIndex.value,
+        datatype: exportNiftiType.value,
+        writeSform: exportNiftiSform.value,
+        gz: exportNiftiGz.value,
+        output,
+      },
+    });
+    exportNiftiMsg.value = res;
+  } catch (e) {
+    exportNiftiMsg.value =
+      "导出失败：" +
+      (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
+  } finally {
+    exportingNifti.value = false;
+    exportNiftiOpen.value = false;
+  }
+}
 </script>
 
 <template>
@@ -519,6 +594,9 @@ async function onExportDicom() {
         <button class="export-btn" :disabled="!isRealFile || exportingDicom" @click="exportDicomOpen = true">
           {{ exportingDicom ? "导出中…" : "导出DICOM" }}
         </button>
+        <button class="export-btn" :disabled="!isRealFile || exportingNifti" @click="exportNiftiOpen = true">
+          {{ exportingNifti ? "导出中…" : "导出NIfTI" }}
+        </button>
         <span v-if="!isRealFile" class="hint-sm">示例数据不可导出</span>
         <span
           v-if="exportMsg"
@@ -532,13 +610,22 @@ async function onExportDicom() {
           :class="{ ok: exportDicomMsg.startsWith('已导出') }"
           >{{ exportDicomMsg }}</span
         >
+        <span
+          v-if="exportNiftiMsg"
+          class="export-msg"
+          :class="{ ok: exportNiftiMsg.startsWith('已导出') }"
+          >{{ exportNiftiMsg }}</span
+        >
       </section>
     </aside>
 
     <!-- 导出 JPEG 对话框 -->
     <div v-if="exportJpegOpen" class="modal-mask" @click.self="exportJpegOpen = false">
       <div class="modal export-modal">
-        <div class="modal-title">导出 JPEG</div>
+        <div class="modal-title">
+          <span>导出 JPEG</span>
+          <button class="modal-close" type="button" @click="exportJpegOpen = false" aria-label="关闭">&times;</button>
+        </div>
 
         <div class="modal-row">
           <span class="modal-label">范围</span>
@@ -586,7 +673,10 @@ async function onExportDicom() {
     <!-- 导出 DICOM 对话框 -->
     <div v-if="exportDicomOpen" class="modal-mask" @click.self="exportDicomOpen = false">
       <div class="modal export-dicom-modal">
-        <div class="modal-title">导出 DICOM</div>
+        <div class="modal-title">
+          <span>导出 DICOM</span>
+          <button class="modal-close" type="button" @click="exportDicomOpen = false" aria-label="关闭">&times;</button>
+        </div>
 
         <div class="modal-row">
           <span class="modal-label">范围</span>
@@ -634,6 +724,50 @@ async function onExportDicom() {
           <button @click="exportDicomOpen = false">取消</button>
           <button class="primary" :disabled="exportingDicom" @click="onExportDicom">
             {{ exportingDicom ? "导出中…" : "导出" }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 导出 NIfTI 对话框 -->
+    <div v-if="exportNiftiOpen" class="modal-mask" @click.self="exportNiftiOpen = false">
+      <div class="modal export-nifti-modal">
+        <div class="modal-title">
+          <span>导出 NIfTI</span>
+          <button class="modal-close" type="button" @click="exportNiftiOpen = false" aria-label="关闭">&times;</button>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">范围</span>
+          <label class="radio"><input type="radio" value="current" v-model="exportNiftiScope" /> 当前帧（2D）</label>
+          <label class="radio"><input type="radio" value="all" v-model="exportNiftiScope" /> 整个序列（3D 体）</label>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">数据类型</span>
+          <select v-model="exportNiftiType" class="nii-type-select">
+            <option v-for="t in niftiTypeOptions" :key="t.value" :value="t.value">{{ t.label }}</option>
+          </select>
+        </div>
+        <div class="modal-row nii-hint-row" v-if="niftiTypeHint">
+          <span class="modal-label"></span>
+          <span class="hint-sm" :class="{ warn: exportNiftiType === 'uint8' }">{{ niftiTypeHint }}</span>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">朝向</span>
+          <label class="radio"><input type="checkbox" v-model="exportNiftiSform" /> 写入 sform（RAS 仿射，基于 IOP/位置）</label>
+        </div>
+
+        <div class="modal-row">
+          <span class="modal-label">压缩</span>
+          <label class="radio"><input type="checkbox" v-model="exportNiftiGz" /> 输出 .nii.gz（gzip 压缩）</label>
+        </div>
+
+        <div class="modal-actions">
+          <button @click="exportNiftiOpen = false">取消</button>
+          <button class="primary" :disabled="exportingNifti" @click="onExportNifti">
+            {{ exportingNifti ? "导出中…" : "导出" }}
           </button>
         </div>
       </div>
@@ -825,10 +959,36 @@ async function onExportDicom() {
   max-width: 92vw;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
 }
-.export-modal .modal-title {
+/* 导出对话框统一标题栏：与主题区（--bg-1）用差异较小的 --bg-2 区分，并带关闭按钮 */
+.modal-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   font-size: 15px;
   font-weight: 600;
-  margin-bottom: 14px;
+  color: var(--fg);
+  padding: 12px 20px;
+  margin: -18px -20px 16px;
+  background: var(--titlebar-bg, var(--bg-2, #1c1f26));
+  border-bottom: 1px solid var(--border);
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+.modal-close {
+  background: transparent;
+  border: none;
+  color: var(--fg-dim);
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.modal-close:hover {
+  background: rgba(127, 127, 127, 0.18);
+  color: var(--fg);
 }
 .modal-row {
   display: flex;
@@ -954,5 +1114,26 @@ async function onExportDicom() {
 }
 .anon-pwd {
   flex: 1;
+}
+
+/* 导出 NIfTI 对话框 */
+.export-nifti-modal {
+  width: 560px;
+}
+.nii-type-select {
+  background: var(--bg-2, #1c1f26);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 5px 8px;
+  font-size: 13px;
+  flex: 1;
+  max-width: 460px;
+}
+.nii-hint-row {
+  align-items: flex-start;
+}
+.nii-hint-row .hint-sm.warn {
+  color: #ff8a65;
 }
 </style>

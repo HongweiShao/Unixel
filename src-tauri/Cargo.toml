@@ -37,6 +37,8 @@ imageproc = "0.25"
 ab_glyph = "0.2"
 # NIfTI 体数据（MPR 基础）
 nifti = { version = "0.11", features = ["ndarray_volumes"] }
+# NIfTI 写出需在主代码中构造 Array3（与 nifti 内部 ndarray 0.13 同源，避免 write_nifti 类型不匹配）
+ndarray = "0.13"
 # HTJ2K（纯 Rust 移植 OpenJPH，无 C/C++ FFI）：无损 TS 201 / 有损 TS 203
 openjph-core = "0.1"
 # 导出 DICOM 封装像素所需的 smallvec（dicom-core 已传递依赖，此处显式声明以直接 use）

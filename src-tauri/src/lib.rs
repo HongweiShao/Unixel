@@ -2916,6 +2916,376 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
     Ok(format!("已导出 {} 个 DICOM 文件", written))
 }
 
+// ---------- 导出 NIfTI ----------
+// 把当前查看的序列（DICOM 多帧/多切片，或已加载 NIfTI 体）导出为标准 NIfTI-1 文件。
+// 复用 load_source_frames 收集多帧 HU（已按解剖位置重排 inferior→superior），重组为 3D 体 [x][y][z]。
+// 由 DICOM 的 ImageOrientationPatient + ImagePositionPatient 构造 RAS 仿射 sform（LPS→RAS 对 x/y 取负）。
+// nifti 写端强制 scl_slope/intercept=1，故整数类型直接存 HU 值（scl=1，无损当 HU 在类型范围内）。
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportNiftiArgs {
+    mode: String, // "current" | "all"
+    file_path: String,
+    series_paths: Vec<String>,
+    frame_index: u32,
+    datatype: String, // int16 | float32 | uint16 | uint8 | int32 | float64
+    write_sform: bool,
+    gz: bool,
+    output: String, // 完整输出文件路径（含 .nii / .nii.gz）
+}
+
+fn dicom_pixel_spacing(obj: &Option<FileDicomObject<InMemDicomObject>>) -> [f32; 2] {
+    let mut s = [1.0f32, 1.0f32];
+    if let Some(o) = obj {
+        if let Some(v) = elem_vec_f64(o, "PixelSpacing") {
+            if v.len() >= 2 {
+                s[0] = v[0] as f32;
+                s[1] = v[1] as f32;
+            }
+        }
+    }
+    s
+}
+
+fn dicom_image_orientation(obj: &Option<FileDicomObject<InMemDicomObject>>) -> Option<[f32; 6]> {
+    let o = obj.as_ref()?;
+    let v = elem_vec_f64(o, "ImageOrientationPatient")?;
+    if v.len() >= 6 {
+        Some([
+            v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32, v[4] as f32, v[5] as f32,
+        ])
+    } else {
+        None
+    }
+}
+
+fn dicom_slice_thickness(obj: &Option<FileDicomObject<InMemDicomObject>>) -> f32 {
+    if let Some(o) = obj {
+        if let Some(v) = elem_vec_f64(o, "SliceThickness") {
+            if !v.is_empty() && v[0] > 0.0 {
+                return v[0] as f32;
+            }
+        }
+    }
+    0.0
+}
+
+fn nifti_normal(iop: [f32; 6]) -> [f32; 3] {
+    let r = [iop[0], iop[1], iop[2]];
+    let c = [iop[3], iop[4], iop[5]];
+    [
+        r[1] * c[2] - r[2] * c[1],
+        r[2] * c[0] - r[0] * c[2],
+        r[0] * c[1] - r[1] * c[0],
+    ]
+}
+
+fn ensure_nii_ext(output: &str, gz: bool) -> String {
+    let base = output.trim_end_matches(".nii.gz").trim_end_matches(".nii");
+    if gz {
+        format!("{}.nii.gz", base)
+    } else {
+        format!("{}.nii", base)
+    }
+}
+
+fn nifti_lossy_note(dt: &str, hu_min: f32, hu_max: f32) -> &'static str {
+    match dt {
+        "uint8" => "（注意：uint8 已线性映射到 0-255，存在精度损失）",
+        "int16" => {
+            if hu_min < -32768.0 || hu_max > 32767.0 {
+                "（注意：HU 超出 int16 范围，已截断，存在精度损失）"
+            } else {
+                ""
+            }
+        }
+        "uint16" => {
+            if hu_min < -1024.0 || hu_max + 1024.0 > 65535.0 {
+                "（注意：HU+1024 超出 uint16 范围，已截断）"
+            } else {
+                ""
+            }
+        }
+        _ => "",
+    }
+}
+
+/// 核心写出：frames 按 [z][y*nx+x] 排列的多帧 HU；构造 RAS sform 并量化写出。
+pub(crate) fn export_nifti_core(
+    frames: &[Vec<f32>],
+    nx: u32,
+    ny: u32,
+    spacing: [f32; 2],
+    iop: Option<[f32; 6]>,
+    first_pos: Option<[f32; 3]>,
+    sz: f32,
+    datatype: &str,
+    write_sform: bool,
+    gz: bool,
+    output: &str,
+) -> Result<String, String> {
+    use nifti::{writer::WriterOptions, NiftiHeader};
+    use ndarray::Array3;
+
+    let nz = frames.len() as u32;
+    if nz == 0 {
+        return Err("没有可导出的帧".into());
+    }
+    let nxp = nx as usize;
+    let nyp = ny as usize;
+
+    // 体素 HU 范围（量化提示 / uint8 线性映射）
+    let mut hu_min = f32::INFINITY;
+    let mut hu_max = f32::NEG_INFINITY;
+    for f in frames {
+        for &v in f {
+            if v < hu_min {
+                hu_min = v;
+            }
+            if v > hu_max {
+                hu_max = v;
+            }
+        }
+    }
+    if !hu_min.is_finite() {
+        hu_min = 0.0;
+        hu_max = 1.0;
+    }
+
+    // 构造 reference header
+    let mut hdr = NiftiHeader::default();
+    hdr.pixdim = [1.0, spacing[0], spacing[1], sz, 1.0, 1.0, 1.0, 1.0];
+    hdr.xyzt_units = 2; // mm
+    hdr.cal_max = hu_max;
+    hdr.cal_min = hu_min;
+    hdr.descrip = b"Unixel - Hongwei Shao".to_vec();
+    if write_sform {
+        if let (Some(iopv), Some(p0)) = (iop, first_pos) {
+            let n = nifti_normal(iopv);
+            let r = [iopv[0], iopv[1], iopv[2]];
+            let c = [iopv[3], iopv[4], iopv[5]];
+            // LPS→RAS：x、y 取负，z 不变；k 增大=superior（与 decode_nifti 读取约定一致）
+            hdr.srow_x = [-r[0] * spacing[0], -c[0] * spacing[1], -n[0] * sz, -p0[0]];
+            hdr.srow_y = [-r[1] * spacing[0], -c[1] * spacing[1], -n[1] * sz, -p0[1]];
+            hdr.srow_z = [r[2] * spacing[0], c[2] * spacing[1], n[2] * sz, p0[2]];
+            hdr.sform_code = 1;
+            hdr.qform_code = 0;
+        } else {
+            hdr.sform_code = 0;
+            hdr.qform_code = 0;
+        }
+    } else {
+        hdr.sform_code = 0;
+        hdr.qform_code = 0;
+    }
+
+    let path = ensure_nii_ext(output, gz);
+    let note = nifti_lossy_note(datatype, hu_min, hu_max);
+
+    // 按 datatype 量化并写出（scl 由写端强制 1.0，整数类型直接存 HU）
+    match datatype {
+        "float32" => {
+            let mut arr = Array3::<f32>::zeros((nxp, nyp, nz as usize));
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        arr[[x, y, z]] = fz[y * nxp + x];
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        "float64" => {
+            let mut arr = Array3::<f64>::zeros((nxp, nyp, nz as usize));
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        arr[[x, y, z]] = fz[y * nxp + x] as f64;
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        "int16" => {
+            let mut arr = Array3::<i16>::zeros((nxp, nyp, nz as usize));
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        arr[[x, y, z]] = fz[y * nxp + x].round().clamp(-32768.0, 32767.0) as i16;
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        "int32" => {
+            let mut arr = Array3::<i32>::zeros((nxp, nyp, nz as usize));
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        arr[[x, y, z]] = fz[y * nxp + x].round() as i32;
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        "uint16" => {
+            let mut arr = Array3::<u16>::zeros((nxp, nyp, nz as usize));
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        arr[[x, y, z]] = (fz[y * nxp + x] + 1024.0).clamp(0.0, 65535.0) as u16;
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        "uint8" => {
+            let mut arr = Array3::<u8>::zeros((nxp, nyp, nz as usize));
+            let denom = (hu_max - hu_min).max(1e-6);
+            for z in 0..nz as usize {
+                let fz = &frames[z];
+                for y in 0..nyp {
+                    for x in 0..nxp {
+                        let t = (fz[y * nxp + x] - hu_min) / denom;
+                        arr[[x, y, z]] = (t * 255.0).clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+            WriterOptions::new(&path)
+                .reference_header(&hdr)
+                .compress(gz)
+                .write_nifti(&arr)
+                .map_err(|e| format!("写入 NIfTI 失败: {}", e))?;
+        }
+        other => return Err(format!("不支持的 NIfTI 数据类型: {}", other)),
+    }
+
+    Ok(format!(
+        "已导出 NIfTI（{}×{}×{}，{}）{}",
+        nx, ny, nz, datatype, note
+    ))
+}
+
+#[tauri::command]
+fn export_nifti(args: ExportNiftiArgs) -> Result<String, String> {
+    // 1. 收集多帧 HU（已按 inferior->superior 重排）
+    let (all_frames, obj, w, h) = load_source_frames(&args.file_path)?;
+    let frames: Vec<Vec<f32>> = if args.mode == "all" {
+        let mut v = Vec::new();
+        if !args.series_paths.is_empty() {
+            for p in &args.series_paths {
+                let (fs, _, _, _) = load_source_frames(p)?;
+                if let Some(f) = fs.into_iter().next() {
+                    v.push(f);
+                }
+            }
+        } else {
+            v = all_frames;
+        }
+        v
+    } else {
+        let idx = (args.frame_index as usize).min(all_frames.len().saturating_sub(1));
+        vec![all_frames.into_iter().nth(idx).unwrap_or_default()]
+    };
+
+    // 2. 空间元数据
+    let spacing = dicom_pixel_spacing(&obj);
+    let iop = dicom_image_orientation(&obj);
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    if !args.series_paths.is_empty() {
+        for p in &args.series_paths {
+            if let Ok(o) = dicom_object::open_file(p) {
+                if let Some(v) = elem_vec_f64(&o, "ImagePositionPatient") {
+                    if v.len() >= 3 {
+                        positions.push([v[0] as f32, v[1] as f32, v[2] as f32]);
+                    }
+                }
+            }
+        }
+    } else if let Some(o) = &obj {
+        if let Some(v) = elem_vec_f64(o, "ImagePositionPatient") {
+            if v.len() >= 3 {
+                positions.push([v[0] as f32, v[1] as f32, v[2] as f32]);
+            }
+        }
+    }
+    // 按沿法向投影排序，取首切片为原点，跨度估算切片间距
+    let (first_pos, sz) = if let Some(iopv) = iop {
+        let n = nifti_normal(iopv);
+        if !positions.is_empty() {
+            let mut idxs: Vec<usize> = (0..positions.len()).collect();
+            idxs.sort_by(|&a, &b| {
+                let pa = positions[a][0] * n[0] + positions[a][1] * n[1] + positions[a][2] * n[2];
+                let pb = positions[b][0] * n[0] + positions[b][1] * n[1] + positions[b][2] * n[2];
+                pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let fp = positions[idxs[0]];
+            let p0 = positions[idxs[0]][0] * n[0]
+                + positions[idxs[0]][1] * n[1]
+                + positions[idxs[0]][2] * n[2];
+            let p1 = positions[idxs[positions.len() - 1]][0] * n[0]
+                + positions[idxs[positions.len() - 1]][1] * n[1]
+                + positions[idxs[positions.len() - 1]][2] * n[2];
+            let span = (p1 - p0).abs();
+            let s = if positions.len() >= 2 && span > 1e-6 {
+                span / (positions.len() as f32 - 1.0)
+            } else {
+                let st = dicom_slice_thickness(&obj);
+                if st > 0.0 {
+                    st
+                } else {
+                    1.0
+                }
+            };
+            (Some(fp), s)
+        } else {
+            (None, 1.0)
+        }
+    } else {
+        (None, 1.0)
+    };
+
+    export_nifti_core(
+        &frames,
+        w,
+        h,
+        spacing,
+        iop,
+        first_pos,
+        sz,
+        &args.datatype,
+        args.write_sform,
+        args.gz,
+        &args.output,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2933,7 +3303,8 @@ pub fn run() {
             export_tags,
             scan_folder_series,
             load_series_files,
-            export_dicom
+            export_dicom,
+            export_nifti
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2944,6 +3315,129 @@ pub fn run() {
 #[cfg(test)]
 mod export_dicom_tests {
     use super::*;
+
+    #[test]
+    fn export_nifti_args_deserialize_camel() {
+        // 验证前端 camelCase 字段（filePath/seriesPaths/frameIndex/writeSform）
+        // 能正确反序列化为 ExportNiftiArgs（回归：曾缺 rename_all 导致 missing field `file_path`）
+        let json = r#"{
+            "mode": "all",
+            "filePath": "/tmp/ct.dcm",
+            "seriesPaths": ["/tmp/ct_1.dcm", "/tmp/ct_2.dcm"],
+            "frameIndex": 3,
+            "datatype": "int16",
+            "writeSform": true,
+            "gz": true,
+            "output": "/tmp/out.nii.gz"
+        }"#;
+        let args: ExportNiftiArgs = serde_json::from_str(json).expect("camelCase 反序列化失败");
+        assert_eq!(args.mode, "all");
+        assert_eq!(args.file_path, "/tmp/ct.dcm");
+        assert_eq!(args.series_paths, vec!["/tmp/ct_1.dcm", "/tmp/ct_2.dcm"]);
+        assert_eq!(args.frame_index, 3);
+        assert_eq!(args.datatype, "int16");
+        assert!(args.write_sform);
+        assert!(args.gz);
+        assert_eq!(args.output, "/tmp/out.nii.gz");
+    }
+
+    #[test]
+    fn export_nifti_roundtrip() {
+        use ndarray::Array3;
+        use nifti::{writer::WriterOptions, NiftiHeader};
+        let (nx, ny, nz) = (16u32, 12u32, 8u32);
+        let nxp = nx as usize;
+        let nyp = ny as usize;
+        // 构造已知体素（含负值，模拟 HU），写出为临时 NIfTI 源
+        let src = "tests/nii_src_roundtrip.nii.gz";
+        {
+            let mut data = Array3::<f32>::zeros((nxp, nyp, nz as usize));
+            for x in 0..nxp {
+                for y in 0..nyp {
+                    for z in 0..nz as usize {
+                        data[[x, y, z]] = ((x * 3 + y * 5 + z * 7) % 2000) as f32 - 500.0;
+                    }
+                }
+            }
+            WriterOptions::new(src)
+                .write_nifti(&data)
+                .expect("write src nii");
+        }
+        // 读回为 frames（[z][y*nx+x]）
+        let vol = decode_nifti(src).expect("decode src");
+        let vox: Vec<f32> = vol
+            .voxel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut frames: Vec<Vec<f32>> = Vec::with_capacity(nz as usize);
+        for z in 0..nz as usize {
+            let mut f = vec![0f32; nxp * nyp];
+            for y in 0..nyp {
+                for x in 0..nxp {
+                    f[y * nxp + x] = vox[((x * nyp + y) * nz as usize) + z];
+                }
+            }
+            frames.push(f);
+        }
+        // float32 无损往返
+        let out = "tests/nii_out_roundtrip.nii.gz";
+        let res = export_nifti_core(
+            &frames, nx, ny, [1.0, 1.0], None, None, 1.0, "float32", true, true, out,
+        );
+        assert!(res.is_ok(), "export_nifti_core 失败: {:?}", res.err());
+        let out_vol = decode_nifti(out).expect("decode out");
+        assert_eq!(out_vol.meta.dims, [nx, ny, nz]);
+        let out_vox: Vec<f32> = out_vol
+            .voxel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for x in 0..nxp {
+            for y in 0..nyp {
+                for z in 0..nz as usize {
+                    let i = ((x * nyp + y) * nz as usize) + z;
+                    let expected = ((x * 3 + y * 5 + z * 7) % 2000) as f32 - 500.0;
+                    assert!(
+                        (expected - out_vox[i]).abs() < 1e-2,
+                        "float32 体素 ({},{},{}) 不一致: {} vs {}",
+                        x,
+                        y,
+                        z,
+                        expected,
+                        out_vox[i]
+                    );
+                }
+            }
+        }
+        // int16 无损（HU 在 int16 范围内，scl=1 直接存整数）
+        let out2 = "tests/nii_out_int16.nii.gz";
+        let res2 = export_nifti_core(
+            &frames, nx, ny, [1.0, 1.0], None, None, 1.0, "int16", true, true, out2,
+        );
+        assert!(res2.is_ok(), "export_nifti_core int16 失败: {:?}", res2.err());
+        let vol2 = decode_nifti(out2).expect("decode int16 out");
+        let v2: Vec<f32> = vol2
+            .voxel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for x in 0..nxp {
+            for y in 0..nyp {
+                for z in 0..nz as usize {
+                    let i = ((x * nyp + y) * nz as usize) + z;
+                    let expected = ((x * 3 + y * 5 + z * 7) % 2000) as f32 - 500.0;
+                    assert!(
+                        (expected.round() - v2[i]).abs() < 1e-2,
+                        "int16 体素 ({},{},{}) 不一致",
+                        x,
+                        y,
+                        z
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn md5_known_vector() {
