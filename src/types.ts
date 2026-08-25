@@ -137,3 +137,27 @@ export function decodePixelBytes(b: Uint8Array | string | number[]): Float32Arra
   // slice() 保证 offset=0、buffer 长度对齐，便于按 f32 解释
   return new Float32Array(bytes.slice().buffer);
 }
+
+// 批量转换（batch_convert）相关结构
+export interface BatchItem {
+  src: string;
+  out: string;
+  ok: boolean;
+  error: string | null;
+}
+export interface BatchResult {
+  total: number;
+  ok: number;
+  failed: number;
+  cancelled: boolean;
+  items: BatchItem[];
+}
+export interface BatchProgress {
+  k: number; // 已完成计数（含当前）
+  n: number; // 总数
+  label: string; // 序列 / 文件标签
+  src: string; // 源路径
+  out: string; // 输出路径
+  ok: boolean;
+  error: string | null;
+}

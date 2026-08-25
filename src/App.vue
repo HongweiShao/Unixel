@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch } from "vue";
+import { ref, computed, reactive, onMounted, nextTick, watch } from "vue";
 import Viewer from "./components/Viewer.vue";
 import type {
   DicomMeta,
@@ -12,11 +12,14 @@ import type {
   SeriesTree,
   SeriesBrief,
   StudyBrief,
+  BatchResult,
+  BatchProgress,
 } from "./types";
 import { decodePixelBytes } from "./types";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { listen } from "@tauri-apps/api/event";
 import aboutIcon from "./assets/about-icon.png";
 
 type ImageView = { meta: DicomMeta; frames: Float32Array[] };
@@ -37,8 +40,8 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 
 // 菜单栏
-const openMenu = ref<"file" | "help" | null>(null);
-function toggleMenu(m: "file" | "help") {
+const openMenu = ref<"file" | "help" | "proc" | null>(null);
+function toggleMenu(m: "file" | "help" | "proc") {
   openMenu.value = openMenu.value === m ? null : m;
 }
 function closeMenu() {
@@ -51,6 +54,176 @@ const appVersion = ref("0.1.0");
 function openAbout() {
   aboutOpen.value = true;
   closeMenu();
+}
+
+// ===== 批量转换 =====
+const batchOpen = ref(false);
+const batchInputDir = ref("");
+const batchInputType = ref<"dicom" | "nifti">("dicom");
+const batchOutputDir = ref("");
+const batchOutputType = ref<"dicom" | "nifti">("nifti");
+const batchRunning = ref(false);
+const batchCancelling = ref(false);
+const batchDone = ref(false);
+const batchLog = ref<BatchProgress[]>([]);
+const batchSummary = ref<string | null>(null);
+const batchError = ref<string | null>(null);
+
+// 输出选项（复刻导出 DICOM / 导出 NIfTI 的选项）
+const tsOptions = [
+  { value: "explicit", label: "未压缩（显式 VR）" },
+  { value: "implicit", label: "未压缩（隐式 VR）" },
+  { value: "rle", label: "RLE 无损" },
+  { value: "jpegls_lossless", label: "JPEG-LS 无损" },
+  { value: "jpegls_loss", label: "JPEG-LS 有损（近无损）" },
+  { value: "htj2k_lossless", label: "HTJ2K 无损" },
+  { value: "htj2k_lossy", label: "HTJ2K 有损" },
+] as const;
+const anonGroups = [
+  { id: "patient", label: "患者" },
+  { id: "institution", label: "机构" },
+  { id: "personnel", label: "人员" },
+  { id: "device", label: "设备" },
+  { id: "datetime", label: "日期时间" },
+  { id: "uid", label: "实例 UID" },
+] as const;
+const anonMethodOptions = (gid: string) => {
+  const base = [
+    { value: "keep", label: "保留" },
+    { value: "delete", label: "删除" },
+    { value: "hash", label: "MD5 摘要" },
+    { value: "encrypt", label: "加密" },
+  ] as const;
+  if (gid === "uid") return [...base, { value: "regenerate", label: "重生成 UID" }] as const;
+  return base;
+};
+const niftiTypeOptions = [
+  { value: "int16", label: "int16（默认 · HU 整数 · 无损当 HU∈[-32768,32767]）" },
+  { value: "int32", label: "int32（HU 整数 · 范围大）" },
+  { value: "uint16", label: "uint16（偏移 +1024 · HU∈[-1024,64511]）" },
+  { value: "uint8", label: "uint8（线性映射到 0-255 · 强制有损）" },
+  { value: "float32", label: "float32（HU 浮点 · 无损 · 体积大）" },
+  { value: "float64", label: "float64（高精度 · 体积最大）" },
+] as const;
+
+const batchTs = ref<string>("explicit");
+const batchTsDegree = ref<number>(90);
+const batchAnonMap = reactive<Record<string, string>>(
+  Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
+);
+const batchAnonPassword = ref<string>("unixel");
+const batchNiiType = ref<string>("int16");
+const batchNiiSform = ref(true);
+const batchNiiGz = ref(true);
+
+const batchOutputIsDicom = computed(() => batchOutputType.value === "dicom");
+const batchTsNeedsDegree = computed(
+  () => batchTs.value === "htj2k_lossy" || batchTs.value === "jpegls_loss"
+);
+const batchAnonNeedPassword = computed(() =>
+  Object.values(batchAnonMap).some((m) => m === "encrypt")
+);
+const batchStartDisabled = computed(() => {
+  if (batchRunning.value) return true;
+  if (!batchInputDir.value || !batchOutputDir.value) return true;
+  // NIfTI → NIfTI 不允许（后端同样拒绝）
+  if (batchInputType.value === "nifti" && batchOutputType.value === "nifti") return true;
+  return false;
+});
+const niftiTypeHint = computed(() => {
+  switch (batchNiiType.value) {
+    case "uint8":
+      return "uint8 为强制有损：HU 线性映射到 0-255 并裁剪，仅适合预览。";
+    case "int16":
+      return "int16 无损当 HU∈[-32768,32767]；超出将截断（后端会提示）。";
+    case "uint16":
+      return "uint16 需 +1024 偏移后再存；HU<-1024 或 >64511 将截断（后端会提示）。";
+    case "int32":
+      return "int32 范围大，基本无截断风险，但体积极大。";
+    default:
+      return "浮点类型无损保留 HU，但体积显著大于整数类型。";
+  }
+});
+
+function openBatchConvert() {
+  batchOpen.value = true;
+  closeMenu();
+}
+function closeBatchConvert() {
+  if (batchRunning.value) return; // 运行中禁止关闭，使用「取消」中止
+  batchOpen.value = false;
+}
+async function pickBatchInputDir() {
+  const dir = await open({ directory: true, title: "选择输入文件夹" });
+  if (dir && !Array.isArray(dir)) batchInputDir.value = dir as string;
+}
+async function pickBatchOutputDir() {
+  const dir = await open({ directory: true, title: "选择输出文件夹" });
+  if (dir && !Array.isArray(dir)) batchOutputDir.value = dir as string;
+}
+function buildBatchOptions() {
+  const anonRanges = anonGroups
+    .map((g) => ({ id: g.id, method: batchAnonMap[g.id] }))
+    .filter((r) => r.method && r.method !== "keep");
+  if (batchOutputIsDicom.value) {
+    return {
+      transferSyntax: batchTs.value,
+      anonRanges,
+      password: batchAnonPassword.value,
+      datatype: "int16",
+      writeSform: true,
+      gz: true,
+      quality: batchTsNeedsDegree.value ? batchTsDegree.value : 90,
+    };
+  }
+  return {
+    transferSyntax: "explicit",
+    anonRanges: [],
+    password: "",
+    datatype: batchNiiType.value,
+    writeSform: batchNiiSform.value,
+    gz: batchNiiGz.value,
+    quality: 90,
+  };
+}
+async function startBatch() {
+  if (batchStartDisabled.value) return;
+  batchRunning.value = true;
+  batchCancelling.value = false;
+  batchDone.value = false;
+  batchLog.value = [];
+  batchSummary.value = null;
+  batchError.value = null;
+  try {
+    const res = await invoke<BatchResult>("batch_convert", {
+      args: {
+        inputDir: batchInputDir.value,
+        inputType: batchInputType.value,
+        outputDir: batchOutputDir.value,
+        outputType: batchOutputType.value,
+        options: buildBatchOptions(),
+      },
+    });
+    batchDone.value = true;
+    batchSummary.value =
+      `完成：成功 ${res.ok} · 失败 ${res.failed} · 共 ${res.total}` +
+      (res.cancelled ? "（已取消）" : "");
+  } catch (e) {
+    batchError.value =
+      "批量转换失败：" +
+      (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
+  } finally {
+    batchRunning.value = false;
+  }
+}
+async function cancelBatch() {
+  if (!batchRunning.value) return;
+  batchCancelling.value = true;
+  try {
+    await invoke("batch_convert_cancel");
+  } catch {
+    /* 忽略：取消命令本身失败不影响前端状态 */
+  }
 }
 
 // 详情对话框
@@ -598,6 +771,17 @@ onMounted(async () => {
   } catch {
     /* 非 Tauri 环境忽略，保留默认版本 */
   }
+  // 监听后端批量转换进度事件（命令运行期间实时推送）
+  try {
+    await listen<BatchProgress>("batch-progress", (e) => {
+      batchLog.value.push(e.payload);
+      if (batchLog.value.length > 400) {
+        batchLog.value.splice(0, batchLog.value.length - 400);
+      }
+    });
+  } catch {
+    /* 非 Tauri 环境忽略 */
+  }
 });
 </script>
 
@@ -611,6 +795,12 @@ onMounted(async () => {
           <div v-if="openMenu === 'file'" class="dropdown" @click.stop>
             <button @click="openFile">打开文件…</button>
             <button @click="importFolder">从文件夹导入…</button>
+          </div>
+        </div>
+        <div class="menu" :class="{ open: openMenu === 'proc' }" @click="toggleMenu('proc')">
+          处理 <span class="caret">▾</span>
+          <div v-if="openMenu === 'proc'" class="dropdown" @click.stop>
+            <button @click="openBatchConvert">批量转换…</button>
           </div>
         </div>
         <div class="menu" :class="{ open: openMenu === 'help' }" @click="toggleMenu('help')">
@@ -672,6 +862,7 @@ onMounted(async () => {
           <button :disabled="listLoading" @click="importFolder">
             {{ listLoading ? "导入中…" : "从文件夹导入" }}
           </button>
+          <button :disabled="batchRunning" @click="openBatchConvert">批量转换…</button>
           <button class="ghost" @click="useMock">载入示例体数据（mock）</button>
           <p v-if="error" class="err">⚠ {{ error }}</p>
           <p class="hint">
@@ -770,6 +961,117 @@ onMounted(async () => {
         <div class="ss-foot">
           <button class="ss-cancel" @click="closeSeriesSelect">取消</button>
           <button class="ss-ok" :disabled="!selectedSeries" @click="confirmSeries">打开所选序列</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批量转换对话框 -->
+    <div v-if="batchOpen" class="modal-mask" @click.self="closeBatchConvert">
+      <div class="modal batch">
+        <div class="batch-head">
+          <h2>批量转换</h2>
+          <button class="modal-close-x" type="button" @click="closeBatchConvert" aria-label="关闭">×</button>
+        </div>
+
+        <div class="batch-body">
+          <!-- 区① 输入 -->
+          <section class="batch-zone">
+            <h3>① 输入</h3>
+            <div class="batch-field">
+              <span class="batch-label">输入文件夹</span>
+              <button class="batch-pick" :disabled="batchRunning" @click="pickBatchInputDir">选择…</button>
+              <span class="batch-dir" :title="batchInputDir">{{ batchInputDir || "未选择" }}</span>
+            </div>
+            <div class="batch-field">
+              <span class="batch-label">输入类型</span>
+              <label class="radio"><input type="radio" value="dicom" v-model="batchInputType" :disabled="batchRunning" /> DICOM</label>
+              <label class="radio"><input type="radio" value="nifti" v-model="batchInputType" :disabled="batchRunning" /> NIfTI</label>
+            </div>
+          </section>
+
+          <!-- 区② 输出 -->
+          <section class="batch-zone">
+            <h3>② 输出</h3>
+            <div class="batch-field">
+              <span class="batch-label">输出文件夹</span>
+              <button class="batch-pick" :disabled="batchRunning" @click="pickBatchOutputDir">选择…</button>
+              <span class="batch-dir" :title="batchOutputDir">{{ batchOutputDir || "未选择" }}</span>
+            </div>
+            <div class="batch-field">
+              <span class="batch-label">输出类型</span>
+              <label class="radio"><input type="radio" value="dicom" v-model="batchOutputType" :disabled="batchRunning" /> DICOM</label>
+              <label class="radio"><input type="radio" value="nifti" v-model="batchOutputType" :disabled="batchRunning" /> NIfTI</label>
+              <span v-if="batchInputType === 'nifti' && batchOutputType === 'nifti'" class="batch-warn">NIfTI → NIfTI 不支持</span>
+            </div>
+          </section>
+
+          <!-- 区③ 动态输出选项 -->
+          <section class="batch-zone">
+            <h3>③ 输出选项</h3>
+            <template v-if="batchOutputIsDicom">
+              <div class="batch-field">
+                <span class="batch-label">传输语法</span>
+                <select v-model="batchTs" :disabled="batchRunning" class="batch-select">
+                  <option v-for="o in tsOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+              </div>
+              <div v-if="batchTsNeedsDegree" class="batch-field">
+                <span class="batch-label">有损程度</span>
+                <input type="range" min="10" max="100" step="1" v-model.number="batchTsDegree" :disabled="batchRunning" />
+                <span class="batch-degree">{{ batchTsDegree }}</span>
+              </div>
+              <div class="batch-anon">
+                <div class="batch-anon-title">脱敏分组</div>
+                <div v-for="g in anonGroups" :key="g.id" class="batch-anon-row">
+                  <span class="batch-anon-name">{{ g.label }}</span>
+                  <select v-model="batchAnonMap[g.id]" :disabled="batchRunning" class="batch-select">
+                    <option v-for="m in anonMethodOptions(g.id)" :key="m.value" :value="m.value">{{ m.label }}</option>
+                  </select>
+                </div>
+                <div v-if="batchAnonNeedPassword" class="batch-field">
+                  <span class="batch-label">加密密码</span>
+                  <input type="text" v-model="batchAnonPassword" :disabled="batchRunning" class="batch-input" placeholder="默认 unixel" />
+                </div>
+                <p class="batch-hint">注：自动写入 SoftwareVersions（Unixel），无需手动设置。</p>
+              </div>
+            </template>
+            <template v-else>
+              <div class="batch-field">
+                <span class="batch-label">数据类型</span>
+                <select v-model="batchNiiType" :disabled="batchRunning" class="batch-select">
+                  <option v-for="o in niftiTypeOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+              </div>
+              <p class="batch-hint">{{ niftiTypeHint }}</p>
+              <div class="batch-field">
+                <label class="radio"><input type="checkbox" v-model="batchNiiSform" :disabled="batchRunning" /> 写入 sform（RAS 仿射）</label>
+              </div>
+              <div class="batch-field">
+                <label class="radio"><input type="checkbox" v-model="batchNiiGz" :disabled="batchRunning" /> 输出 .nii.gz（gzip 压缩）</label>
+              </div>
+            </template>
+          </section>
+
+          <!-- 进度 -->
+          <section class="batch-zone">
+            <h3>进度</h3>
+            <div class="batch-log">
+              <p v-if="!batchRunning && !batchDone && !batchError" class="batch-hint">配置完成后点击「开始转换」。</p>
+              <p v-for="(p, i) in batchLog" :key="i" :class="['batch-log-line', p.ok ? 'ok' : 'fail']">
+                [{{ p.k }}/{{ p.n }}] {{ p.label }} {{ p.ok ? '✓' : '✗ ' + (p.error || '') }}
+                <br /><span class="batch-log-src">{{ p.out }}</span>
+              </p>
+              <p v-if="batchCancelling" class="batch-hint">正在取消…</p>
+            </div>
+            <p v-if="batchSummary" class="batch-summary">{{ batchSummary }}</p>
+            <p v-if="batchError" class="batch-error">⚠ {{ batchError }}</p>
+          </section>
+        </div>
+
+        <div class="batch-foot">
+          <button class="ss-cancel" :disabled="batchRunning" @click="closeBatchConvert">关闭</button>
+          <button v-if="!batchRunning" class="ss-ok" :disabled="batchStartDisabled" @click="startBatch">开始转换</button>
+          <button v-else class="batch-cancel-btn" :disabled="batchCancelling" @click="cancelBatch">{{ batchCancelling ? "取消中…" : "取消" }}</button>
         </div>
       </div>
     </div>
@@ -1474,6 +1776,198 @@ main {
 }
 .ss-ok:disabled {
   opacity: 0.5;
+  cursor: default;
+}
+
+/* 批量转换对话框 */
+.modal.batch {
+  width: min(640px, 94vw);
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  position: relative;
+}
+.batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: var(--titlebar-bg, var(--bg-2, #1c1f26));
+  border-bottom: 1px solid var(--border);
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+.batch-head h2 {
+  margin: 0;
+  font-size: 16px;
+}
+.batch-body {
+  overflow: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.batch-zone {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.batch-zone h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+.batch-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.batch-label {
+  flex: 0 0 72px;
+  color: var(--fg-dim);
+}
+.batch-dir {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 12px;
+  color: var(--fg);
+}
+.batch-pick {
+  flex: 0 0 auto;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.batch-pick:hover:not(:disabled) {
+  border-color: var(--fg-dim);
+}
+.batch-pick:disabled,
+.batch-select:disabled,
+.batch-input:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.batch-select,
+.batch-input {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  max-width: 320px;
+}
+.batch-degree {
+  color: var(--fg-dim);
+  font-size: 12px;
+}
+.radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.batch-anon {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+.batch-anon-title {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.batch-anon-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.batch-anon-name {
+  flex: 0 0 72px;
+  font-size: 13px;
+}
+.batch-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fg-dim);
+  line-height: 1.5;
+}
+.batch-warn {
+  color: #e0a000;
+  font-size: 12px;
+}
+.batch-log {
+  max-height: 200px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.batch-log-line {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.batch-log-line.ok {
+  color: #2e9e5b;
+}
+.batch-log-line.fail {
+  color: #e5484d;
+}
+.batch-log-src {
+  color: var(--fg-dim);
+}
+.batch-summary {
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+}
+.batch-error {
+  margin: 0;
+  font-size: 13px;
+  color: #e5484d;
+}
+.batch-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border);
+}
+.batch-cancel-btn {
+  background: #c0392b;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 18px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.batch-cancel-btn:disabled {
+  opacity: 0.6;
   cursor: default;
 }
 </style>

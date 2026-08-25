@@ -12,7 +12,7 @@ use image::GenericImageView;
 use image::RgbaImage;
 use imageproc::drawing::{draw_text_mut, text_size};
 use ab_glyph::{FontRef, PxScale};
-use dicom_object::{mem::InMemElement, FileDicomObject, InMemDicomObject};
+use dicom_object::{mem::InMemElement, FileDicomObject, FileMetaTableBuilder, InMemDicomObject};
 use dicom_core::{PrimitiveValue, VR};
 use dicom_core::value::{InMemFragment, PixelFragmentSequence, Value};
 use dicom_core::value::fragments::Fragments;
@@ -27,6 +27,10 @@ use sha2::Sha256;
 use hmac::Hmac;
 use md5::{Digest, Md5};
 use rand::Rng;
+use nifti::{NiftiObject, ReaderOptions};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use tauri::Emitter;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2148,7 +2152,7 @@ const ANON_GROUPS: &[AnonGroup] = &[
     },
 ];
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AnonRangeArg {
     id: String,
@@ -3286,6 +3290,631 @@ fn export_nifti(args: ExportNiftiArgs) -> Result<String, String> {
     )
 }
 
+// ============ 批量转换 ============
+//
+// 按文件夹级、序列级进行格式互转与重处理：
+//   - DICOM → NIfTI：复用 export_nifti（mode="all"，取各源文件首帧按位置重排 inferior→superior）
+//   - DICOM → DICOM：复用 export_dicom（mode="all" + multifile，逐片写出并保留几何）
+//   - NIfTI → DICOM：新增路径（读 sform/qform 仿射重建 LPS 几何，构造 Secondary Capture 序列）
+// 输出目录镜像输入相对结构；单序列失败不中断，收集错误并跳过继续；后端借取消令牌中止剩余序列。
+
+static BATCH_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+fn batch_cancel_flag() -> &'static Arc<AtomicBool> {
+    BATCH_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+const SC_IMAGE_STORAGE: &str = "1.2.840.10008.5.1.4.1.1.7"; // Secondary Capture Image Storage
+const UNIXEL_IMPL_CLASS_UID: &str = "2.25.12638147865491203746"; // Unixel implementation class UID
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BatchOptions {
+    transfer_syntax: String, // 仅 DICOM 输出：implicit|explicit|rle|htj2k_lossless|htj2k_lossy|jpegls_lossless|jpegls_loss|jpeg
+    anon_ranges: Vec<AnonRangeArg>,
+    password: String,
+    datatype: String, // 仅 NIfTI 输出：int16|int32|uint16|uint8|float32|float64
+    write_sform: bool,
+    gz: bool,
+    quality: u8, // JPEG 有损程度 1-100（仅 jpeg 传输语法使用）
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        BatchOptions {
+            transfer_syntax: "explicit".into(),
+            anon_ranges: Vec::new(),
+            password: String::new(),
+            datatype: "int16".into(),
+            write_sform: true,
+            gz: true,
+            quality: 90,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchConvertArgs {
+    input_dir: String,
+    input_type: String, // "DICOM" | "NIfTI"
+    output_dir: String,
+    output_type: String, // "DICOM" | "NIfTI"
+    options: BatchOptions,
+}
+
+#[derive(Serialize)]
+struct BatchItem {
+    src: String,
+    out: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BatchResult {
+    total: usize,
+    ok: usize,
+    failed: usize,
+    cancelled: bool,
+    items: Vec<BatchItem>,
+}
+
+#[derive(Serialize, Clone)]
+struct BatchProgress {
+    k: usize,
+    n: usize,
+    label: String,
+    src: String,
+    out: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+fn fmt_ds(v: f64) -> String {
+    if !v.is_finite() {
+        return "0".to_string();
+    }
+    let s = format!("{:.6}", v).trim_end_matches('0').trim_end_matches('.').to_string();
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s
+    }
+}
+
+fn put_str(
+    obj: &mut FileDicomObject<InMemDicomObject>,
+    tag: Tag,
+    vr: VR,
+    val: &str,
+) {
+    obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
+}
+
+fn put_us(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, val: u16) {
+    obj.put(InMemElement::new(tag, VR::US, PrimitiveValue::from(val)));
+}
+
+fn put_is(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, val: i32) {
+    obj.put(InMemElement::new(tag, VR::IS, PrimitiveValue::from(val.to_string())));
+}
+
+fn put_ds(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, vals: &[f64]) {
+    let s = vals
+        .iter()
+        .map(|v| fmt_ds(*v))
+        .collect::<Vec<_>>()
+        .join("\\");
+    obj.put(InMemElement::new(tag, VR::DS, PrimitiveValue::from(s)));
+}
+
+fn sanitize_name(s: &str) -> String {
+    s.replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+        .trim()
+        .to_string()
+}
+
+fn relative_parent(path: &str, root: &Path) -> PathBuf {
+    match Path::new(path).strip_prefix(root) {
+        Ok(rel) => rel
+            .parent()
+            .map(|x| x.to_path_buf())
+            .unwrap_or_else(|| PathBuf::new()),
+        Err(_) => PathBuf::new(),
+    }
+}
+
+fn series_label(s: &SeriesBrief) -> String {
+    let desc = s.series_description.clone().unwrap_or_default();
+    let num = s.series_number.map(|n| n.to_string()).unwrap_or_default();
+    let uid = s.series_uid.clone().unwrap_or_default();
+    if !desc.is_empty() {
+        format!(
+            "{}_{}",
+            desc,
+            if num.is_empty() { uid } else { num }
+        )
+    } else if !num.is_empty() {
+        format!("series_{}", num)
+    } else {
+        uid
+    }
+}
+
+fn ts_uid_of(ts_arg: &str) -> Result<&'static str, String> {
+    Ok(match ts_arg {
+        "implicit" => TS_IMPLICIT,
+        "explicit" => TS_EXPLICIT,
+        "rle" => TS_RLE,
+        "htj2k_lossless" => TS_HTJ2K_LOSSLESS,
+        "htj2k_lossy" => TS_HTJ2K_LOSSY,
+        "jpegls_lossless" => TS_JPEGLS_LOSSLESS,
+        "jpegls_loss" => TS_JPEGLS_LOSS,
+        _ => return Err(format!("不支持的传输语法: {}", ts_arg)),
+    })
+}
+
+// 读取 NIfTI 头部仿射（RAS，行主序 4x4）与 flip_z（k 增大是否指向 inferior），
+// 与 decode_nifti 的翻转约定保持一致。
+fn nifti_affine_ras(path: &str) -> Result<(u32, u32, u32, [f64; 16], bool), String> {
+    let obj = ReaderOptions::new()
+        .read_file(path)
+        .map_err(|e| format!("读取 NIfTI 失败: {}", e))?;
+    let hdr = obj.header();
+    let nx = hdr.dim[1] as u32;
+    let ny = hdr.dim[2] as u32;
+    let nz = hdr.dim[3] as u32;
+    let flip_z = if hdr.sform_code > 0 {
+        hdr.srow_z[2] < 0.0
+    } else if hdr.qform_code > 0 {
+        let b = hdr.quatern_b as f64;
+        let c = hdr.quatern_c as f64;
+        let r22 = 1.0 - 2.0 * (b * b + c * c);
+        let qfac = if hdr.pixdim[0] < 0.0 { -1.0 } else { 1.0 };
+        let kz = r22 * (hdr.pixdim[3] as f64).abs() * qfac;
+        kz < 0.0
+    } else {
+        false
+    };
+    let aff = [
+        hdr.srow_x[0] as f64,
+        hdr.srow_x[1] as f64,
+        hdr.srow_x[2] as f64,
+        hdr.srow_x[3] as f64,
+        hdr.srow_y[0] as f64,
+        hdr.srow_y[1] as f64,
+        hdr.srow_y[2] as f64,
+        hdr.srow_y[3] as f64,
+        hdr.srow_z[0] as f64,
+        hdr.srow_z[1] as f64,
+        hdr.srow_z[2] as f64,
+        hdr.srow_z[3] as f64,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    Ok((nx, ny, nz, aff, flip_z))
+}
+
+// NIfTI 体 → DICOM 序列（每片单文件 Secondary Capture），由 sform/qform 还原 LPS 几何。
+fn build_dicom_series(
+    nx: u32,
+    ny: u32,
+    nz: u32,
+    vox: &[f32],
+    aff: &[f64; 16],
+    flip_z: bool,
+    study_uid: &str,
+    series_uid: &str,
+    for_uid: &str,
+    hu_min: f32,
+    hu_max: f32,
+    out_dir: &Path,
+    ts_arg: &str,
+    ts_uid: &str,
+    quality: u8,
+    near: u8,
+    anon_ranges: &[AnonRangeArg],
+    password: &str,
+) -> Result<Vec<String>, String> {
+    // X 轴 = NIfTI i（DICOM 列），Y 轴 = NIfTI j（DICOM 行）；仿射行主序：
+    // aff = [ srow_x(4) ; srow_y(4) ; srow_z(4) ; 0 0 0 1 ]
+    let sx0 = aff[0];
+    let sy0 = aff[4];
+    let sz0 = aff[8];
+    let sx1 = aff[1];
+    let sy1 = aff[5];
+    let sz1 = aff[9];
+    let sx2 = aff[2];
+    let sy2 = aff[6];
+    let sz2 = aff[10];
+    let ox = aff[3];
+    let oy = aff[7];
+    let oz = aff[11];
+    let xnorm = normalize3(&[sx0, sy0, sz0]);
+    let ynorm = normalize3(&[sx1, sy1, sz1]);
+    let col_spacing = (sx0 * sx0 + sy0 * sy0 + sz0 * sz0).sqrt();
+    let row_spacing = (sx1 * sx1 + sy1 * sy1 + sz1 * sz1).sqrt();
+    // ImageOrientationPatient（LPS）：首 3 = 列方向(-X)，末 3 = 行方向(-Y)
+    let iop = [
+        -xnorm[0], -xnorm[1], xnorm[2], -ynorm[0], -ynorm[1], ynorm[2],
+    ];
+    let spacing = [row_spacing, col_spacing];
+    let nxp = nx as usize;
+    let nyp = ny as usize;
+    let nzp = nz as usize;
+    let compressed = matches!(
+        ts_arg,
+        "rle" | "htj2k_lossless" | "htj2k_lossy" | "jpegls_lossless" | "jpegls_loss"
+    );
+    let wc = (hu_min as f64 + hu_max as f64) / 2.0;
+    let ww = (hu_max as f64 - hu_min as f64).max(1.0);
+
+    let mut written: Vec<String> = Vec::with_capacity(nzp);
+    for z in 0..nzp {
+        // 解码体 z（superior 递增）→ 文件 k；IPP 取 (i=0,j=0,k) 的物理位置
+        let k = if flip_z {
+            (nz as i64 - 1 - z as i64) as i64
+        } else {
+            z as i64
+        };
+        let ipx = ox + sx2 * k as f64;
+        let ipy = oy + sy2 * k as f64;
+        let ipz = oz + sz2 * k as f64;
+        let ipp = [-ipx, -ipy, ipz];
+
+        // 构造单帧 i16 LE（HU，slope=1 intercept=0），按图像 (row=y, col=x) 排列
+        let mut frame: Vec<u8> = Vec::with_capacity(nxp * nyp * 2);
+        for y in 0..nyp {
+            for x in 0..nxp {
+                let idx = (x * nyp + y) * nzp + z;
+                let v = vox[idx];
+                let iv = v.round().clamp(-32768.0, 32767.0) as i16;
+                frame.extend_from_slice(&iv.to_le_bytes());
+            }
+        }
+
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid(&gen_uid())
+            .transfer_syntax(ts_uid)
+            .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+            .build()
+            .map_err(|e| format!("构建 DICOM 元信息失败: {}", e))?;
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        put_str(&mut obj, Tag(0x0008, 0x0005), VR::CS, "ISO_IR 100");
+        put_str(&mut obj, Tag(0x0008, 0x0016), VR::UI, SC_IMAGE_STORAGE);
+        put_str(&mut obj, Tag(0x0008, 0x0018), VR::UI, &gen_uid());
+        put_str(&mut obj, Tag(0x0008, 0x0060), VR::CS, "OT");
+        put_str(&mut obj, Tag(0x0008, 0x103E), VR::LO, "Unixel NIfTI to DICOM");
+        put_str(&mut obj, Tag(0x0010, 0x0010), VR::PN, "Unixel^Batch");
+        put_str(&mut obj, Tag(0x0010, 0x0020), VR::LO, "UNIXEL");
+        put_str(&mut obj, Tag(0x0020, 0x000D), VR::UI, study_uid);
+        put_str(&mut obj, Tag(0x0020, 0x000E), VR::UI, series_uid);
+        put_us(&mut obj, Tag(0x0020, 0x0011), 1);
+        put_is(&mut obj, Tag(0x0020, 0x0013), (z + 1) as i32);
+        put_str(&mut obj, Tag(0x0020, 0x0052), VR::UI, for_uid);
+        put_ds(&mut obj, Tag(0x0020, 0x0032), &ipp);
+        put_ds(&mut obj, Tag(0x0020, 0x0037), &iop);
+        put_us(&mut obj, Tag(0x0028, 0x0002), 1);
+        put_str(&mut obj, Tag(0x0028, 0x0004), VR::CS, "MONOCHROME2");
+        put_us(&mut obj, Tag(0x0028, 0x0010), ny as u16);
+        put_us(&mut obj, Tag(0x0028, 0x0011), nx as u16);
+        put_ds(&mut obj, Tag(0x0028, 0x0030), &spacing);
+        put_us(&mut obj, Tag(0x0028, 0x0100), 16);
+        put_us(&mut obj, Tag(0x0028, 0x0101), 16);
+        put_us(&mut obj, Tag(0x0028, 0x0102), 15);
+        put_us(&mut obj, Tag(0x0028, 0x0103), 1);
+        put_ds(&mut obj, Tag(0x0028, 0x1050), &[wc]);
+        put_ds(&mut obj, Tag(0x0028, 0x1051), &[ww]);
+        put_ds(&mut obj, Tag(0x0028, 0x1052), &[0.0]);
+        put_ds(&mut obj, Tag(0x0028, 0x1053), &[1.0]);
+        put_ds(&mut obj, Tag(0x0018, 0x0050), &[row_spacing]);
+
+        let info = PixelInfo {
+            bits_allocated: 16,
+            signed: true,
+            samples: 1,
+            width: nx,
+            height: ny,
+        };
+        let p = out_dir
+            .join(format!("slice_{:04}.dcm", z + 1))
+            .to_string_lossy()
+            .to_string();
+        write_one_dicom(
+            &mut obj,
+            &[frame],
+            &info,
+            ts_arg,
+            ts_uid,
+            compressed,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            quality,
+            near,
+            false,
+            anon_ranges,
+            password,
+            &p,
+        )?;
+        written.push(p);
+    }
+    Ok(written)
+}
+
+fn nifti_to_dicom_series(src: &str, out_dir: &Path, opts: &BatchOptions) -> Result<String, String> {
+    let vol = decode_nifti(src)?;
+    let [nx, ny, nz] = vol.meta.dims;
+    if nx == 0 || ny == 0 || nz == 0 {
+        return Err("NIfTI 体维度为空".into());
+    }
+    let vox: Vec<f32> = vol
+        .voxel_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let (_nx, _ny, _nz, aff, flip_z) = nifti_affine_ras(src)?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("创建输出目录失败: {}", e))?;
+
+    let ts_arg = opts.transfer_syntax.as_str();
+    let ts_uid = ts_uid_of(ts_arg)?;
+    let quality = if ts_arg == "jpeg" {
+        opts.quality.clamp(1, 100)
+    } else {
+        0
+    };
+    let near = if ts_arg == "jpegls_loss" { 8u8 } else { 0u8 };
+
+    let study_uid = gen_uid();
+    let series_uid = gen_uid();
+    let for_uid = gen_uid();
+    let written = build_dicom_series(
+        nx,
+        ny,
+        nz,
+        &vox,
+        &aff,
+        flip_z,
+        &study_uid,
+        &series_uid,
+        &for_uid,
+        vol.meta.hu_min,
+        vol.meta.hu_max,
+        out_dir,
+        ts_arg,
+        ts_uid,
+        quality,
+        near,
+        &opts.anon_ranges,
+        &opts.password,
+    )?;
+    Ok(format!(
+        "已写出 {} 个 DICOM 文件至 {}",
+        written.len(),
+        out_dir.display()
+    ))
+}
+
+#[tauri::command]
+async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<BatchResult, String> {
+    let input_dir = Path::new(&args.input_dir);
+    let output_dir = Path::new(&args.output_dir);
+    if !input_dir.is_dir() {
+        return Err(format!("输入文件夹不存在: {}", args.input_dir));
+    }
+    if args.output_dir.trim().is_empty() {
+        return Err("输出文件夹为空".into());
+    }
+    if args.input_type.eq_ignore_ascii_case("NIfTI")
+        && args.output_type.eq_ignore_ascii_case("NIfTI")
+    {
+        return Err("NIfTI→NIfTI 无意义，请选择不同的输入/输出类型".into());
+    }
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("创建输出文件夹失败: {}", e))?;
+
+    // 收集转换单元（序列级）
+    struct Unit {
+        label: String,
+        paths: Vec<String>,
+        parent_dir: PathBuf,
+        name: String,
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    if args.input_type.eq_ignore_ascii_case("DICOM") {
+        let tree = scan_folder_series(args.input_dir.clone())?;
+        for study in &tree.studies {
+            for series in &study.series {
+                if series.paths.is_empty() {
+                    continue;
+                }
+                let rel = relative_parent(&series.paths[0], input_dir);
+                let name = sanitize_name(&series_label(series));
+                let parent_dir = output_dir.join(&rel);
+                units.push(Unit {
+                    label: format!(
+                        "{} / {}",
+                        study.patient_name.clone().unwrap_or_default(),
+                        series.series_description.clone().unwrap_or_default()
+                    ),
+                    paths: series.paths.clone(),
+                    parent_dir,
+                    name,
+                });
+            }
+        }
+    } else {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_files(input_dir, &mut files);
+        for p in &files {
+            let s = p.to_string_lossy().to_lowercase();
+            if !(s.ends_with(".nii") || s.ends_with(".nii.gz")) {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(input_dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .to_string();
+            let no_ext = rel
+                .trim_end_matches(".nii.gz")
+                .trim_end_matches(".nii")
+                .to_string();
+            let parent_dir = output_dir.join(&no_ext); // 如 output_dir/A/B/vol
+            let name = Path::new(&no_ext)
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or("volume")
+                .to_string();
+            units.push(Unit {
+                label: rel.clone(),
+                paths: vec![p.to_string_lossy().to_string()],
+                parent_dir,
+                name,
+            });
+        }
+    }
+    if units.is_empty() {
+        return Err("未找到可处理的输入文件".into());
+    }
+
+    let flag = batch_cancel_flag();
+    flag.store(false, Ordering::SeqCst);
+    let total = units.len();
+    let mut items: Vec<BatchItem> = Vec::with_capacity(total);
+    let inp = args.input_type.clone();
+    let outp = args.output_type.clone();
+    let opts = args.options;
+    let mut cancelled = false;
+
+    for (idx, unit) in units.iter().enumerate() {
+        if flag.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        let src = unit.paths[0].clone();
+        let res: Result<String, String> = match (
+            inp.eq_ignore_ascii_case("DICOM"),
+            outp.eq_ignore_ascii_case("DICOM"),
+        ) {
+            (true, false) => {
+                // DICOM → NIfTI
+                let out_file = unit
+                    .parent_dir
+                    .join(format!("{}.nii.gz", unit.name));
+                std::fs::create_dir_all(&unit.parent_dir)
+                    .map_err(|e| format!("创建输出目录失败: {}", e))?;
+                let out = out_file.to_string_lossy().to_string();
+                export_nifti(ExportNiftiArgs {
+                    mode: "all".into(),
+                    file_path: src.clone(),
+                    series_paths: unit.paths.clone(),
+                    frame_index: 0,
+                    datatype: opts.datatype.clone(),
+                    write_sform: opts.write_sform,
+                    gz: opts.gz,
+                    output: out.clone(),
+                })
+                .map(|_| out)
+            }
+            (true, true) => {
+                // DICOM → DICOM（multifile，逐片保留几何）
+                let out_dir = unit.parent_dir.join(&unit.name);
+                export_dicom(ExportDicomArgs {
+                    mode: "all".into(),
+                    file_path: src.clone(),
+                    series_paths: unit.paths.clone(),
+                    frame_index: 0,
+                    transfer_syntax: opts.transfer_syntax.clone(),
+                    quality: 0,
+                    wc: 0.0,
+                    ww: 0.0,
+                    anon_ranges: opts.anon_ranges.clone(),
+                    password: opts.password.clone(),
+                    output: out_dir.to_string_lossy().to_string(),
+                    multifile: true,
+                })
+                .map(|_| out_dir.to_string_lossy().to_string())
+            }
+            (false, true) => {
+                // NIfTI → DICOM（新增路径）
+                let out_dir = unit.parent_dir.join(&unit.name);
+                nifti_to_dicom_series(&src, &out_dir, &opts)
+                    .map(|_| out_dir.to_string_lossy().to_string())
+            }
+            (false, false) => Err("NIfTI→NIfTI 无意义".into()),
+        };
+        let (ok_unit, out, error) = match res {
+            Ok(out) => (true, out, None),
+            Err(e) => (false, String::new(), Some(e)),
+        };
+        let item = BatchItem {
+            src: src.clone(),
+            out: out.clone(),
+            ok: ok_unit,
+            error: error.clone(),
+        };
+        items.push(item);
+        let _ = app.emit(
+            "batch-progress",
+            BatchProgress {
+                k: idx + 1,
+                n: total,
+                label: unit.label.clone(),
+                src: src.clone(),
+                out: out.clone(),
+                ok: ok_unit,
+                error: error.clone(),
+            },
+        );
+    }
+
+    if cancelled {
+        // 未处理的单元标记为已取消
+        for unit in &units[items.len()..] {
+            items.push(BatchItem {
+                src: unit.paths[0].clone(),
+                out: String::new(),
+                ok: false,
+                error: Some("已取消（用户中止）".into()),
+            });
+            let _ = app.emit(
+                "batch-progress",
+                BatchProgress {
+                    k: items.len(),
+                    n: total,
+                    label: unit.label.clone(),
+                    src: unit.paths[0].clone(),
+                    out: String::new(),
+                    ok: false,
+                    error: Some("已取消（用户中止）".into()),
+                },
+            );
+        }
+    }
+
+    let ok = items.iter().filter(|i| i.ok).count();
+    let failed = items.len() - ok;
+    let result = BatchResult {
+        total,
+        ok,
+        failed,
+        cancelled,
+        items,
+    };
+    let _ = app.emit("batch-done", &result);
+    Ok(result)
+}
+
+#[tauri::command]
+fn batch_convert_cancel() {
+    batch_cancel_flag().store(true, Ordering::SeqCst);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3304,7 +3933,9 @@ pub fn run() {
             scan_folder_series,
             load_series_files,
             export_dicom,
-            export_nifti
+            export_nifti,
+            batch_convert,
+            batch_convert_cancel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
