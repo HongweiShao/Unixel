@@ -81,6 +81,12 @@ export interface FileTags {
   kind: string; // "dicom" | "nifti" | "image"
   filename: string;
   rows: TagRow[];
+  encryptedAnon?: string | null; // 非空表示该 DICOM 经过本软件加密脱敏
+}
+export interface AnonDecrypted {
+  tag: string;
+  keyword: string;
+  value: string;
 }
 
 // 文件夹导入：序列选择对话框的数据结构（scan_folder_series 返回）

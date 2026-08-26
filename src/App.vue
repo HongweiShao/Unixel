@@ -14,6 +14,7 @@ import type {
   StudyBrief,
   BatchResult,
   BatchProgress,
+  AnonDecrypted,
 } from "./types";
 import { decodePixelBytes } from "./types";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -232,6 +233,12 @@ const detailsLoading = ref(false);
 const detailsTags = ref<FileTags | null>(null);
 const detailsError = ref<string | null>(null);
 const detailsQuery = ref("");
+// 加密脱敏解密
+const anonPwd = ref("");
+const anonDecrypting = ref(false);
+const anonDecryptMsg = ref<string | null>(null);
+const anonDecrypted = ref<AnonDecrypted[] | null>(null);
+const anonDecryptedSet = ref<Set<string>>(new Set());
 
 const fileFilters = [
   {
@@ -703,6 +710,11 @@ async function openDetails() {
   detailsError.value = null;
   detailsQuery.value = "";
   expandedTags.value = new Set();
+  anonPwd.value = "";
+  anonDecrypting.value = false;
+  anonDecryptMsg.value = null;
+  anonDecrypted.value = null;
+  anonDecryptedSet.value = new Set();
   try {
     detailsTags.value = await invoke<FileTags>("file_tags", { path });
   } catch (e) {
@@ -712,6 +724,40 @@ async function openDetails() {
         : (e as { message?: string })?.message ?? String(e);
   } finally {
     detailsLoading.value = false;
+  }
+}
+
+// 对经过加密脱敏的 DICOM，用密码解密还原标签原始值并回填表格
+async function decryptAnon() {
+  if (!currentPath.value) return;
+  anonDecrypting.value = true;
+  anonDecryptMsg.value = null;
+  try {
+    const res = await invoke<AnonDecrypted[]>("decrypt_anon", {
+      path: currentPath.value,
+      password: anonPwd.value,
+    });
+    anonDecrypted.value = res;
+    const map = new Map(res.map((r) => [r.tag, r.value]));
+    const decSet = new Set<string>();
+    if (detailsTags.value) {
+      for (const r of detailsTags.value.rows) {
+        if (map.has(r.tag)) {
+          r.value = map.get(r.tag)!;
+          decSet.add(r.tag);
+        }
+      }
+    }
+    anonDecryptedSet.value = decSet;
+    anonDecryptMsg.value = `✓ 已解密 ${res.length} 个标签，原始值已回填`;
+  } catch (e) {
+    anonDecrypted.value = null;
+    anonDecryptedSet.value = new Set();
+    anonDecryptMsg.value =
+      "解密失败：" +
+      (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
+  } finally {
+    anonDecrypting.value = false;
   }
 }
 
@@ -793,14 +839,14 @@ onMounted(async () => {
         <div class="menu" :class="{ open: openMenu === 'file' }" @click="toggleMenu('file')">
           文件 <span class="caret">▾</span>
           <div v-if="openMenu === 'file'" class="dropdown" @click.stop>
-            <button @click="openFile">打开文件…</button>
-            <button @click="importFolder">从文件夹导入…</button>
+            <button @click="openFile">打开文件</button>
+            <button @click="importFolder">从文件夹导入</button>
           </div>
         </div>
         <div class="menu" :class="{ open: openMenu === 'proc' }" @click="toggleMenu('proc')">
           处理 <span class="caret">▾</span>
           <div v-if="openMenu === 'proc'" class="dropdown" @click.stop>
-            <button @click="openBatchConvert">批量转换…</button>
+            <button @click="openBatchConvert">批量转换</button>
           </div>
         </div>
         <div class="menu" :class="{ open: openMenu === 'help' }" @click="toggleMenu('help')">
@@ -862,7 +908,7 @@ onMounted(async () => {
           <button :disabled="listLoading" @click="importFolder">
             {{ listLoading ? "导入中…" : "从文件夹导入" }}
           </button>
-          <button :disabled="batchRunning" @click="openBatchConvert">批量转换…</button>
+          <button :disabled="batchRunning" @click="openBatchConvert">批量转换</button>
           <button class="ghost" @click="useMock">载入示例体数据（mock）</button>
           <p v-if="error" class="err">⚠ {{ error }}</p>
           <p class="hint">
@@ -1097,6 +1143,26 @@ onMounted(async () => {
             />
             <button class="modal-close-x" type="button" @click="detailsOpen = false" aria-label="关闭">&times;</button>
           </div>
+        <div v-if="detailsTags?.encryptedAnon" class="anon-decrypt">
+          <p class="anon-note">
+            ⚠ 检测到本文件经过加密脱敏（{{ detailsTags.encryptedAnon }}）。输入导出时设置的密码可解密还原被隐藏标签的原始值。
+          </p>
+          <div class="anon-row">
+            <input
+              v-model="anonPwd"
+              class="anon-input"
+              type="password"
+              placeholder="输入脱敏密码（默认 unixel）"
+              @keyup.enter="decryptAnon"
+            />
+            <button class="anon-btn" :disabled="anonDecrypting" @click="decryptAnon">
+              {{ anonDecrypting ? "解密中…" : "解密显示" }}
+            </button>
+          </div>
+          <p v-if="anonDecryptMsg" class="anon-msg" :class="{ ok: anonDecryptMsg.startsWith('✓') }">
+            {{ anonDecryptMsg }}
+          </p>
+        </div>
         <div class="details-body">
           <div
             v-if="exportTagsMsg"
@@ -1133,7 +1199,7 @@ onMounted(async () => {
                 </td>
                 <td
                   class="val"
-                  :class="{ expanded: expandedTags.has(r.tag) }"
+                  :class="{ expanded: expandedTags.has(r.tag), decrypted: anonDecryptedSet.has(r.tag) }"
                   :ref="(el) => setValRef(r.tag, el)"
                 >{{ r.value }}</td>
                 <td class="row-actions">
@@ -1573,6 +1639,59 @@ main {
 .details-err {
   color: #e5484d;
 }
+/* 加密脱敏解密面板（文件标签信息对话框内） */
+.anon-decrypt {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  padding: 10px 14px;
+}
+.anon-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  line-height: 1.5;
+}
+.anon-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.anon-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+}
+.anon-input:focus {
+  outline: none;
+  border-color: var(--accent, #2f9e6e);
+}
+.anon-btn {
+  padding: 6px 16px;
+  font-size: 13px;
+  border: 1px solid var(--accent, #2f9e6e);
+  border-radius: 6px;
+  background: var(--accent, #2f9e6e);
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.anon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.anon-msg {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #e5484d;
+}
+.anon-msg.ok {
+  color: var(--accent, #2f9e6e);
+}
 .tags-table {
   width: 100%;
   border-collapse: collapse;
@@ -1605,6 +1724,10 @@ main {
   overflow: visible;
   text-overflow: clip;
   word-break: break-all;
+}
+.tags-table td.val.decrypted {
+  color: var(--accent, #2f9e6e);
+  font-weight: 600;
 }
 .tags-table .row-actions {
   width: 56px;

@@ -96,6 +96,8 @@ struct FileTags {
     kind: String, // "dicom" | "nifti" | "image"
     filename: String,
     rows: Vec<TagRow>,
+    // 若 DICOM 经过本软件「加密脱敏」，则给出算法标识；前端据此提示输入密码解密
+    encrypted_anon: Option<String>,
 }
 
 // 从文件夹导入：仅返回顶层影像文件的概要信息（不含像素），前端按需懒加载像素
@@ -1380,10 +1382,17 @@ fn dicom_tags(path: &str) -> Result<FileTags, String> {
             description,
         });
     }
+    // 检测本软件「加密脱敏」标记：私有创建者 UNIXEL 的 (0099,UNIXEL,01) 记录算法标识
+    let encrypted_anon = obj
+        .private_element(0x0099, "UNIXEL", 0x01)
+        .ok()
+        .and_then(|el| el.value().to_str().ok().map(|c| c.to_string()))
+        .filter(|s| s.trim() == "PBKDF2-HMAC-SHA256;AES-256-GCM");
     Ok(FileTags {
         kind: "dicom".into(),
         filename: fname(path),
         rows,
+        encrypted_anon,
     })
 }
 
@@ -1423,6 +1432,7 @@ fn nifti_tags(path: &str) -> Result<FileTags, String> {
     Ok(FileTags {
         kind: "nifti".into(),
         filename: fname(path),
+        encrypted_anon: None,
         rows,
     })
 }
@@ -1481,6 +1491,7 @@ fn image_tags(path: &str, format_label: &str) -> Result<FileTags, String> {
         kind: "image".into(),
         filename: fname(path),
         rows,
+        encrypted_anon: None,
     })
 }
 
@@ -1545,6 +1556,7 @@ fn file_tags(path: String) -> Result<FileTags, String> {
             kind: "image".into(),
             filename: fname(&path),
             rows,
+            encrypted_anon: None,
         })
     } else {
         image_tags(&path, image_format_label(&lower))
@@ -2540,6 +2552,30 @@ fn to_hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn hex_val(c: u8) -> Result<u8, String> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(format!("非法十六进制字符: {}", c as char)),
+    }
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err("十六进制字符串长度必须为偶数".into());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = hex_val(pair[0])?;
+        let lo = hex_val(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
 fn derive_key(pw: &str, salt: &[u8]) -> Vec<u8> {
     let mut key = vec![0u8; 32];
     pbkdf2_derive::<Hmac<Sha256>>(pw.as_bytes(), salt, 100_000, &mut key)
@@ -2559,7 +2595,6 @@ fn aes_gcm_encrypt(key: &[u8], pt: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[cfg(test)]
 fn aes_gcm_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| e.to_string())?;
     let (nonce, ct) = data.split_at(12);
@@ -3013,6 +3048,97 @@ fn anonymize_object(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ---- 加密脱敏解密（供「更多信息」标签查看时按密码还原）----
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnonDecrypted {
+    tag: String,
+    keyword: String,
+    value: String,
+}
+
+/// 读取本软件写入的加密脱敏元数据（私有创建者 UNIXEL）。
+/// 返回 (算法标识, 盐字节, 映射 JSON)。
+fn read_anon_mapping(
+    obj: &FileDicomObject<InMemDicomObject>,
+) -> Result<(String, Vec<u8>, serde_json::Value), String> {
+    let algo_el = obj
+        .private_element(0x0099, "UNIXEL", 0x01)
+        .map_err(|_| "未检测到本软件的加密脱敏标记".to_string())?;
+    let algo = algo_el
+        .value()
+        .to_str()
+        .map_err(|e| format!("读取算法标识失败: {}", e))?
+        .to_string();
+    let salt_el = obj
+        .private_element(0x0099, "UNIXEL", 0x02)
+        .map_err(|_| "缺少盐值（加密脱敏元数据不完整）".to_string())?;
+    let salt_hex = salt_el
+        .value()
+        .to_str()
+        .map_err(|e| format!("读取盐值失败: {}", e))?
+        .to_string();
+    let salt = hex_decode(&salt_hex).map_err(|e| format!("盐值解析失败: {}", e))?;
+    let map_el = obj
+        .private_element(0x0099, "UNIXEL", 0x03)
+        .map_err(|_| "缺少加密映射（加密脱敏元数据不完整）".to_string())?;
+    let map_bytes = map_el
+        .value()
+        .to_bytes()
+        .map_err(|e| format!("读取加密映射失败: {}", e))?;
+    let mapping: serde_json::Value = serde_json::from_slice(&map_bytes)
+        .map_err(|e| format!("解析加密映射失败: {}", e))?;
+    Ok((algo, salt, mapping))
+}
+
+#[tauri::command]
+fn decrypt_anon(path: String, password: String) -> Result<Vec<AnonDecrypted>, String> {
+    let obj = dicom_object::open_file(&path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+    let (algo, salt, mapping) = read_anon_mapping(&obj)?;
+    if algo.trim() != "PBKDF2-HMAC-SHA256;AES-256-GCM" {
+        return Err(format!("不支持的加密算法: {}", algo));
+    }
+    // 留空时回落到导出端默认口令（与 anonymize_object 保持一致）
+    let pw = if password.is_empty() {
+        "unixel".to_string()
+    } else {
+        password
+    };
+    let key = derive_key(&pw, &salt);
+    let entries = mapping
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or("加密映射缺少 entries 字段")?;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let tag = e
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let kw = e
+            .get("kw")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ct_hex = e
+            .get("ct_hex")
+            .and_then(|v| v.as_str())
+            .ok_or("加密条目缺少密文")?;
+        let ct = hex_decode(ct_hex).map_err(|err| format!("密文解析失败（{}）: {}", tag, err))?;
+        let pt = aes_gcm_decrypt(&key, &ct)
+            .map_err(|_| format!("解密失败：密码错误或密文损坏（标签 {}）", tag))?;
+        let value = String::from_utf8_lossy(&pt).to_string();
+        out.push(AnonDecrypted {
+            tag,
+            keyword: kw,
+            value,
+        });
+    }
+    Ok(out)
 }
 
 // ---- 单文件写出 ----
@@ -4264,10 +4390,83 @@ pub fn run() {
             export_dicom,
             export_nifti,
             batch_convert,
-            batch_convert_cancel
+            batch_convert_cancel,
+            decrypt_anon
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ============ 加密脱敏解密单元测试 ============
+
+#[cfg(test)]
+mod anon_decrypt_tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_anon_roundtrip() {
+        // 构造含 PatientName 的 DICOM 对象
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid(&gen_uid())
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+            .build()
+            .expect("构建文件元表");
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        obj.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Zhang^San"),
+        ));
+
+        // 以 encrypt 方法脱敏 patient 组
+        let ranges = vec![AnonRangeArg {
+            id: "patient".to_string(),
+            method: "encrypt".to_string(),
+        }];
+        anonymize_object(&mut obj, &ranges, "secret123", false).expect("脱敏");
+
+        // 写临时文件后走 decrypt_anon（密码正确）
+        let path = std::env::temp_dir().join(format!("unixel_anon_test_{}.dcm", std::process::id()));
+        obj.write_to_file(&path).expect("写临时文件");
+        let res = decrypt_anon(path.to_str().unwrap().to_string(), "secret123".to_string())
+            .expect("解密");
+        let entry = res
+            .iter()
+            .find(|e| e.keyword == "PatientName")
+            .expect("应包含 PatientName 解密结果");
+        assert_eq!(entry.value, "Zhang^San");
+
+        // 错误密码必须失败（AES-GCM 认证失败）
+        let bad = decrypt_anon(path.to_str().unwrap().to_string(), "wrong".to_string());
+        assert!(bad.is_err(), "错误密码应解密失败");
+
+        // 留空密码回落到默认口令 unixel（与导出端一致）
+        let mut obj2 = FileDicomObject::new_empty_with_meta(
+            FileMetaTableBuilder::new()
+                .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(&gen_uid())
+                .transfer_syntax("1.2.840.10008.1.2.1")
+                .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                .build()
+                .unwrap(),
+        );
+        obj2.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Li^Si"),
+        ));
+        anonymize_object(&mut obj2, &ranges, "", false).unwrap();
+        let path2 =
+            std::env::temp_dir().join(format!("unixel_anon_test2_{}.dcm", std::process::id()));
+        obj2.write_to_file(&path2).unwrap();
+        let res2 = decrypt_anon(path2.to_str().unwrap().to_string(), "".to_string()).unwrap();
+        assert_eq!(res2[0].value, "Li^Si");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
 }
 
 // ============ 导出 DICOM 单元测试 ============
