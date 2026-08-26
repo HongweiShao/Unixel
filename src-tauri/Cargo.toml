@@ -19,7 +19,7 @@ serde_json = "1"
 serde_bytes = "0.11"
 # 医学影像解码：DICOM 对象 / 像素 / 字典
 dicom-object = "0.7"
-dicom-pixeldata = "0.7"
+dicom-pixeldata = { version = "0.7", features = ["openjp2"] }
 dicom-dictionary-std = "0.7"
 dicom-core = "0.7"
 # 传输语法注册表 + 编码 trait（用于按显式 VR 小端编码器写出 HTJ2K 等未注册压缩语法）
