@@ -3089,7 +3089,14 @@ fn read_anon_mapping(
         .value()
         .to_bytes()
         .map_err(|e| format!("读取加密映射失败: {}", e))?;
-    let mapping: serde_json::Value = serde_json::from_slice(&map_bytes)
+    // 修复：OB 私有元素在写入时若明文长度为奇数，写入器会按 DICOM 偶长度对齐规则补一个
+    // 0x00 填充字节。该尾随字节会让 serde_json 报 "trailing characters"。解析前剥离尾随的
+    // NUL(0x00)/空格(0x20) 填充（映射 JSON 始终以 '}' 结尾，尾随字节纯属填充，可安全丢弃）。
+    let mut end = map_bytes.len();
+    while end > 0 && (map_bytes[end - 1] == 0x00 || map_bytes[end - 1] == 0x20) {
+        end -= 1;
+    }
+    let mapping: serde_json::Value = serde_json::from_slice(&map_bytes[..end])
         .map_err(|e| format!("解析加密映射失败: {}", e))?;
     Ok((algo, salt, mapping))
 }
@@ -4466,6 +4473,57 @@ mod anon_decrypt_tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn anon_mapping_trailing_pad_tolerated() {
+        // 回归：当 (0099,0103) 明文 JSON 长度为奇数时，写入器会补一个 0x00 填充字节，
+        // read_anon_mapping 必须容忍并正确解析，否则会报 "trailing characters at line 1 column N"。
+        let salt = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        // 构造一个合法 JSON，并确保其字节长度为奇数（模拟真实文件奇数长度被补齐的场景）。
+        let mut json = String::from(
+            r#"{"algo":"PBKDF2-HMAC-SHA256;AES-256-GCM","iterations":100000,"salt_hex":"1122334455667788","entries":[]}"#,
+        );
+        if json.len() % 2 == 0 {
+            // 在结尾 '}' 前插入一个空格（JSON 允许 '}' 前的空白），使整体长度变奇数。
+            json.insert(json.len() - 1, ' ');
+        }
+        let mut bytes = json.into_bytes();
+        assert!(bytes.len() % 2 == 1, "测试构造的 JSON 应为奇数长度");
+
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid(&gen_uid())
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+            .build()
+            .expect("构建文件元表");
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        obj.put_private_element(
+            0x0099,
+            "UNIXEL",
+            0x01,
+            VR::LO,
+            PrimitiveValue::from("PBKDF2-HMAC-SHA256;AES-256-GCM"),
+        )
+        .unwrap();
+        obj.put_private_element(
+            0x0099,
+            "UNIXEL",
+            0x02,
+            VR::LO,
+            PrimitiveValue::from(to_hex(&salt)),
+        )
+        .unwrap();
+        // 奇数长度字节 + 写入器会补的 0x00 尾随填充
+        bytes.push(0x00);
+        obj.put_private_element(0x0099, "UNIXEL", 0x03, VR::OB, PrimitiveValue::from(bytes))
+            .unwrap();
+
+        // 修复前此处会报 "trailing characters"；修复后应成功解析出 algo 与 entries。
+        let (algo, _salt, mapping) = read_anon_mapping(&obj).expect("应容忍尾随 0x00 填充");
+        assert_eq!(algo.trim(), "PBKDF2-HMAC-SHA256;AES-256-GCM");
+        assert!(mapping.get("entries").and_then(|v| v.as_array()).is_some());
     }
 }
 
