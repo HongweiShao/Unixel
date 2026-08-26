@@ -181,6 +181,18 @@ pub(crate) fn window_to_hu(wc: f64, ww: f64, slope: f64, intercept: f64) -> (f64
 // 核心解码逻辑（与 Tauri 解耦，便于单元测试）
 pub(crate) fn decode_dicom_file(path: &str) -> Result<DicomImage, String> {
     let obj = dicom_object::open_file(path).map_err(|e| format!("打开文件失败: {}", e))?;
+
+    // 压缩传输语法回退：dicom-pixeldata 0.7 仅内置 JPEG(50/51)/RLE(5) 解码器，
+    // 对 JPEG-LS(80/81) 与 HTJ2K(200/201/203) 无原生解码器，需走项目自带纯 Rust 解码，
+    // 否则会出现 "Unsupported TransferSyntax" 错误（本应用自身导出的这两类 DICOM 亦无法回读）。
+    let ts = obj.meta().transfer_syntax.clone();
+    if ts == TS_JPEGLS_LOSSLESS || ts == TS_JPEGLS_LOSS {
+        return decode_dicom_jpegls(&obj, path);
+    }
+    if ts == TS_HTJ2K_LOSSLESS || ts == TS_HTJ2K_LOSSY || ts == "1.2.840.10008.1.2.4.203" {
+        return decode_dicom_htj2k(&obj, path);
+    }
+
     let pd = obj
         .decode_pixel_data()
         .map_err(|e| format!("解码像素数据失败（传输语法可能未支持）: {}", e))?;
@@ -324,6 +336,323 @@ pub(crate) fn decode_dicom_file(path: &str) -> Result<DicomImage, String> {
         },
         pixel_bytes,
     })
+}
+
+/// JPEG-LS 解码回退（dicom-pixeldata 0.7 未内置 JPEG-LS 解码器）。
+/// 项目自带 pure_jpegls（纯 Rust，ITU-T T.87）对 TS 1.2.840.10008.1.2.4.80（无损）/ .81（近无损）
+/// 做精确逆解码：提取封装 PixelData 片段（每帧一个 fragment）→ 逐帧 pure_jpegls::decode →
+/// 按 BitsAllocated / PixelRepresentation 还原存储值 → 应用 Modality LUT（Rescale）得 HU(f32)。
+/// 多帧 Enhanced 序列按逐帧平面位置重排，与传统多帧保持原序，与标准解码路径一致。
+fn decode_dicom_jpegls(
+    obj: &FileDicomObject<InMemDicomObject>,
+    path: &str,
+) -> Result<DicomImage, String> {
+    use jpegls::decode as jpegls_decode;
+
+    let attr_u32 = |name: &str, default: u32| -> u32 {
+        obj.element_by_name(name)
+            .ok()
+            .and_then(|e| e.to_str().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    };
+    let attr_f64 = |name: &str, default: f64| -> f64 {
+        obj.element_by_name(name)
+            .ok()
+            .and_then(|e| e.to_str().ok())
+            .and_then(|s| {
+                s.split('\\')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+            .unwrap_or(default)
+    };
+
+    let width = attr_u32("Columns", 0);
+    let height = attr_u32("Rows", 0);
+    let frames = attr_u32("NumberOfFrames", 1);
+    let samples = attr_u32("SamplesPerPixel", 1);
+    let bits_allocated = attr_u32("BitsAllocated", 16);
+    let bits_stored = attr_u32("BitsStored", bits_allocated);
+    let pixel_representation = attr_u32("PixelRepresentation", 0);
+    let signed = pixel_representation == 1;
+
+    if width == 0 || height == 0 {
+        return Err("JPEG-LS 解码失败：缺少 Rows/Columns".into());
+    }
+    if samples != 1 {
+        return Err(format!(
+            "暂仅支持单通道（灰度）影像，当前每像素样本数 = {}",
+            samples
+        ));
+    }
+    if !(8..=16).contains(&bits_allocated) {
+        return Err(format!(
+            "JPEG-LS 仅支持 8/16 bit，当前 BitsAllocated = {}",
+            bits_allocated
+        ));
+    }
+
+    let slope = attr_f64("RescaleSlope", 1.0);
+    let intercept = attr_f64("RescaleIntercept", 0.0);
+
+    // 提取封装 PixelData 片段（BOT 单独存储，fragments() 仅返回帧数据片段）
+    let pd_elem = obj
+        .element_by_name("PixelData")
+        .map_err(|e| format!("读取 PixelData 失败: {}", e))?;
+    let frags: Vec<Vec<u8>> = match pd_elem.value() {
+        Value::PixelSequence(seq) => seq.fragments().to_vec(),
+        _ => return Err("JPEG-LS 解码失败：PixelData 非封装格式".into()),
+    };
+
+    let frame_count = frames as usize;
+    // 片段数 == 帧数：逐帧解码；单帧多片段：合并后整体解码。
+    let per_frame: Vec<Vec<u8>> = if frags.len() == frame_count {
+        frags
+    } else if frame_count == 1 {
+        vec![frags.concat()]
+    } else {
+        return Err(format!(
+            "JPEG-LS 片段数({}) 与帧数({}) 不匹配且非单帧，无法划分帧边界",
+            frags.len(),
+            frame_count
+        ));
+    };
+
+    let npx = (width * height) as usize;
+    let mut hu: Vec<f32> = Vec::with_capacity(frame_count * npx);
+
+    for frag in &per_frame {
+        let (decoded, dw, dh) = jpegls_decode(frag, width, height)
+            .map_err(|e| format!("JPEG-LS 解码失败: {}", e))?;
+        if dw as usize != width as usize || dh as usize != height as usize {
+            return Err(format!(
+                "JPEG-LS 解码尺寸不符：期望 {}x{}，实际 {}x{}",
+                width, height, dw, dh
+            ));
+        }
+        // u16 → 存储值（有符号按位还原）→ HU
+        let stored: Vec<f32> = if bits_allocated <= 8 {
+            decoded.iter().map(|&v| (v as u8) as f32).collect()
+        } else if signed {
+            decoded.iter().map(|&v| (v as i16) as f32).collect()
+        } else {
+            decoded.iter().map(|&v| v as f32).collect()
+        };
+        for s in stored {
+            hu.push((s as f64 * slope + intercept) as f32);
+        }
+    }
+
+    // 多帧 Enhanced：按逐帧平面位置重排（与传统多帧保持原序）；与标准解码路径一致
+    if frame_count > 1 {
+        if let (Some(oop), Some(per_pos)) = (
+            obj.element_by_name("ImageOrientationPatient")
+                .ok()
+                .and_then(|e| e.to_str().ok())
+                .and_then(|s| parse_ds_vec(&s)),
+            per_frame_positions(obj),
+        ) {
+            if oop.len() == 6 && per_pos.len() == frame_count {
+                let normal = normalize3(&cross3(
+                    &[oop[0], oop[1], oop[2]],
+                    &[oop[3], oop[4], oop[5]],
+                ));
+                let flip = if normal[2] >= 0.0 { 1.0 } else { -1.0 };
+                let mut idxs: Vec<usize> = (0..frame_count).collect();
+                idxs.sort_by(|&a, &b| {
+                    let ka = (per_pos[a][0] * normal[0]
+                        + per_pos[a][1] * normal[1]
+                        + per_pos[a][2] * normal[2])
+                        * flip;
+                    let kb = (per_pos[b][0] * normal[0]
+                        + per_pos[b][1] * normal[1]
+                        + per_pos[b][2] * normal[2])
+                        * flip;
+                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut reordered = vec![0.0f32; hu.len()];
+                for (new_i, &old_i) in idxs.iter().enumerate() {
+                    reordered[new_i * npx..(new_i + 1) * npx]
+                        .copy_from_slice(&hu[old_i * npx..(old_i + 1) * npx]);
+                }
+                hu = reordered;
+            }
+        }
+    }
+
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown.dcm")
+        .to_string();
+
+    let window_center_in = attr_f64("WindowCenter", 40.0);
+    let window_width_in = attr_f64("WindowWidth", 400.0);
+    let (window_center, window_width) = window_to_hu(window_center_in, window_width_in, slope, intercept);
+
+    let photometric = obj
+        .element_by_name("PhotometricInterpretation")
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("MONOCHROME2"))
+        .to_string();
+
+    let mut hu_min = f32::INFINITY;
+    let mut hu_max = f32::NEG_INFINITY;
+    for &v in &hu {
+        if v < hu_min {
+            hu_min = v;
+        }
+        if v > hu_max {
+            hu_max = v;
+        }
+    }
+    if !hu_min.is_finite() || !hu_max.is_finite() {
+        hu_min = -1024.0;
+        hu_max = 3071.0;
+    }
+
+    let mut pixel_bytes = Vec::with_capacity(hu.len() * 4);
+    for v in &hu {
+        pixel_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    Ok(DicomImage {
+        meta: DicomMeta {
+            path: path.to_string(),
+            filename,
+            width,
+            height,
+            frames,
+            bits_stored: bits_stored as u16,
+            pixel_representation: pixel_representation as u16,
+            slope,
+            intercept,
+            window_center,
+            window_width,
+            photometric,
+            hu_min,
+            hu_max,
+        },
+        pixel_bytes,
+    })
+}
+
+/// HTJ2K 解码回退（dicom-pixeldata 0.7 未内置 HTJ2K 解码器）。
+/// 复用项目自带 openjph-core 解码器：取首个 PixelData 片段（单帧 DICOM 常见；
+/// 合并多帧仅解码首帧，与 load_htj2k 行为一致）→ decode_htj2k。
+/// 覆盖本应用非标准 UID(.200/.201) 与官方 UID(.203)。
+fn decode_dicom_htj2k(
+    obj: &FileDicomObject<InMemDicomObject>,
+    path: &str,
+) -> Result<DicomImage, String> {
+    let pd_elem = obj
+        .element_by_name("PixelData")
+        .map_err(|e| format!("读取 PixelData 失败: {}", e))?;
+    let frag: Vec<u8> = match pd_elem.value() {
+        Value::PixelSequence(seq) => {
+            let frags = seq.fragments();
+            if frags.is_empty() {
+                return Err("HTJ2K 解码失败：PixelData 无片段".into());
+            }
+            frags[0].clone()
+        }
+        _ => return Err("HTJ2K 解码失败：PixelData 非封装格式".into()),
+    };
+    let mut img = decode_htj2k(&frag)?;
+    img.meta.path = path.to_string();
+    img.meta.filename = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown.dcm")
+        .to_string();
+    Ok(img)
+}
+
+#[cfg(test)]
+mod jpegls_decode_tests {
+    use super::*;
+
+    /// JPEG-LS DICOM 解码回退的往返验证：用导出路径 encode_jpegls_frames 构造封装 PixelData，
+    /// 再经 decode_dicom_jpegls 回读，确认存储值无损还原（无窗映射、无符号处理）。
+    #[test]
+    fn decode_jpegls_dicom_roundtrip() {
+        let info = PixelInfo {
+            bits_allocated: 16,
+            signed: false,
+            samples: 1,
+            width: 4,
+            height: 4,
+        };
+        let orig: Vec<u16> = (0u16..16).collect();
+        let frame: Vec<u8> = orig.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let pd_elem = encode_jpegls_frames(&[frame], &info, 0).expect("encode jpegls");
+
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.7")
+            .media_storage_sop_instance_uid("1.2.3")
+            .transfer_syntax(TS_JPEGLS_LOSSLESS)
+            .implementation_class_uid("2.25.12638147865491203746")
+            .build()
+            .expect("meta");
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0010),
+            VR::US,
+            PrimitiveValue::from(4u16),
+        )); // Rows
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0011),
+            VR::US,
+            PrimitiveValue::from(4u16),
+        )); // Columns
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0002),
+            VR::US,
+            PrimitiveValue::from(1u16),
+        )); // SamplesPerPixel
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0100),
+            VR::US,
+            PrimitiveValue::from(16u16),
+        )); // BitsAllocated
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0101),
+            VR::US,
+            PrimitiveValue::from(16u16),
+        )); // BitsStored
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0103),
+            VR::US,
+            PrimitiveValue::from(0u16),
+        )); // PixelRepresentation
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0008),
+            VR::IS,
+            PrimitiveValue::from(1i32),
+        )); // NumberOfFrames
+        obj.put(InMemElement::new(
+            Tag(0x0028, 0x0004),
+            VR::CS,
+            PrimitiveValue::from("MONOCHROME2"),
+        )); // PhotometricInterpretation
+        obj.put(pd_elem);
+
+        let img = decode_dicom_jpegls(&obj, "test").expect("decode jpegls");
+        assert_eq!(img.meta.width, 4);
+        assert_eq!(img.meta.height, 4);
+        assert_eq!(img.meta.frames, 1);
+        let hu: Vec<f32> = img
+            .pixel_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(hu, orig.iter().map(|v| *v as f32).collect::<Vec<_>>());
+    }
 }
 
 // B1：常规图像导入（PNG/JPG/TIFF）→ 单帧灰度 DicomImage 结构
