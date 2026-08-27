@@ -1088,7 +1088,7 @@ onMounted(async () => {
                   <input type="text" v-model="batchAnonPassword" :disabled="batchRunning" class="batch-input" placeholder="默认 unixel" />
                 </div>
                 <div class="batch-field">
-                  <span class="batch-label">原密码(还原)</span>
+                  <span class="batch-label">解密密码</span>
                   <input type="password" v-model="batchAnonRestorePassword" :disabled="batchRunning" class="batch-input" placeholder="还原已加密脱敏用，留空则直接处理" />
                 </div>
                 <p class="batch-hint">注：自动写入 SoftwareVersions（Unixel），无需手动设置。</p>

@@ -783,19 +783,14 @@ async function onExportNifti() {
           <span class="hint-sm">正在诊断脱敏状态…</span>
         </div>
         <div class="modal-row anon-diagnosis" v-else-if="anonDiagnosis">
-          <span class="modal-label"></span>
+          <span class="modal-label">{{ anonDiagnosis.hasUnixelMapping ? "解密密码" : "" }}</span>
           <div class="anon-diag-box" v-if="anonDiagnosis.hasUnixelMapping">
-            <p class="anon-diag-note">
-              ✓ 已加密脱敏（可还原）。输入<strong>原始密码</strong>可还原后重新脱敏；留空将叠加加密。
-            </p>
-            <div class="anon-restore-row">
-              <input
-                type="password"
-                v-model="anonRestorePassword"
-                class="anon-pwd"
-                placeholder="原始密码"
-              />
-            </div>
+            <input
+              type="password"
+              v-model="anonRestorePassword"
+              class="anon-pwd"
+              placeholder="输入原始密码可还原后重新脱敏；留空将叠加加密。"
+            />
           </div>
           <div class="anon-diag-box" v-else-if="anonDiagnosis.patientIdentityRemoved">
             <p class="anon-diag-note">
