@@ -395,12 +395,12 @@ const tsNeedsDegree = computed(
 
 // 脱敏分组（id 与后端 ANON_GROUPS 一致）
 const anonGroups = [
-  { id: "patient", label: "患者" },
-  { id: "institution", label: "机构" },
-  { id: "personnel", label: "人员" },
-  { id: "device", label: "设备" },
+  { id: "patient", label: "患者身份" },
+  { id: "personnel", label: "人员身份" },
+  { id: "institution", label: "机构信息" },
+  { id: "device", label: "设备信息" },
   { id: "datetime", label: "日期时间" },
-  { id: "uid", label: "实例 UID" },
+  { id: "uid", label: "唯一标识" },
   { id: "freetext", label: "自由文本" },
 ] as const;
 // 各分组可选脱敏方式；uid 额外支持「重生成 UID」
@@ -416,9 +416,9 @@ const anonMethodOptions = (gid: string) => {
   }
   return base;
 };
-// 当前各分组选定的方式（UID 默认重生成；其余默认保留）
+// 当前各分组选定的方式（默认均为「保留」；唯一标识亦默认保留）
 const anonMethodMap = reactive<Record<string, string>>(
-  Object.fromEntries(anonGroups.map((g) => [g.id, g.id === "uid" ? "regenerate" : "keep"]))
+  Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
 );
 const anonNeedPassword = computed(() =>
   Object.values(anonMethodMap).some((m) => m === "encrypt")
