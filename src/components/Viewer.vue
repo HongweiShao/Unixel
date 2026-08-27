@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, reactive, onMounted, onUnmounted, watch } from "vue";
-import type { DicomMeta } from "../types";
+import type { DicomMeta, AnonDiagnosis } from "../types";
 import { applyWindow } from "../windowing";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -342,6 +342,29 @@ const exportTs = ref<string>("explicit");
 const exportDicomQuality = ref(90);
 const exportMultifile = ref(false);
 const anonPassword = ref("");
+// 方案A「还原重脱敏」：导出时填入「原密码」可还原本工具加密脱敏的原始值后再按所选方式重脱敏。
+const anonRestorePassword = ref("");
+const anonDiagnosis = ref<AnonDiagnosis | null>(null);
+const anonDiagnosing = ref(false);
+
+// 打开导出对话框时诊断当前文件的脱敏状态（方案A 前置）
+watch(exportDicomOpen, async (open) => {
+  if (!open || !isRealFile.value) {
+    anonDiagnosis.value = null;
+    return;
+  }
+  anonRestorePassword.value = "";
+  anonDiagnosis.value = null;
+  anonDiagnosing.value = true;
+  try {
+    const dx = await invoke<AnonDiagnosis>("diagnose_anon", { path: props.meta.path });
+    anonDiagnosis.value = dx;
+  } catch {
+    anonDiagnosis.value = null;
+  } finally {
+    anonDiagnosing.value = false;
+  }
+});
 const exportingDicom = ref(false);
 const exportDicomMsg = ref<string | null>(null);
 
@@ -471,6 +494,7 @@ async function onExportDicom() {
         ww: ww.value,
         anonRanges,
         password: anonPassword.value,
+        restorePassword: anonRestorePassword.value,
         output,
         multifile: exportMultifile.value,
       },
@@ -708,6 +732,31 @@ async function onExportNifti() {
                 <option v-for="m in anonMethodOptions(g.id)" :key="m.value" :value="m.value">{{ m.label }}</option>
               </select>
             </div>
+          </div>
+        </div>
+        <div class="modal-row anon-diagnosis" v-if="anonDiagnosing">
+          <span class="modal-label"></span>
+          <span class="hint-sm">正在诊断脱敏状态…</span>
+        </div>
+        <div class="modal-row anon-diagnosis" v-else-if="anonDiagnosis">
+          <span class="modal-label"></span>
+          <div class="anon-diag-box" v-if="anonDiagnosis.hasUnixelMapping">
+            <p class="anon-diag-note">
+              ✓ 检测到本工具加密脱敏标记（方案A 可用）：输入<strong>原脱敏密码</strong>可还原原始值，再按上方所选方式重新脱敏（可换方法/密码，避免二次加密）。
+            </p>
+            <div class="anon-restore-row">
+              <input
+                type="password"
+                v-model="anonRestorePassword"
+                class="anon-pwd"
+                placeholder="原脱敏密码（还原用，留空则直接处理当前值）"
+              />
+            </div>
+          </div>
+          <div class="anon-diag-box" v-else-if="anonDiagnosis.patientIdentityRemoved">
+            <p class="anon-diag-note">
+              ⚠ 该文件已标记为脱敏（(0012,0062)=YES），但未含本工具加密标记，无法自动还原；留空原密码将按所选方式直接处理当前（已脱敏）值。
+            </p>
           </div>
         </div>
         <div class="modal-row" v-if="anonNeedPassword">

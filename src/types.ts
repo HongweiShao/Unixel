@@ -89,6 +89,25 @@ export interface AnonDecrypted {
   value: string;
 }
 
+// 脱敏诊断（diagnose_anon 返回）：供「再脱敏（方案A）」前置判断。
+export interface AnonTagStatus {
+  tag: string; // (GGGG,EEEE)
+  keyword: string;
+  status: "raw" | "deleted" | "md5" | "encrypted" | "missing";
+  preview: string;
+}
+export interface AnonGroupStatus {
+  id: string; // 与前端 anonGroups 的 id 对应（用于映射中文名）
+  tags: AnonTagStatus[];
+}
+export interface AnonDiagnosis {
+  hasUnixelMapping: boolean; // 含本工具 UNIXEL 加密标记（可还原）
+  patientIdentityRemoved: boolean; // (0012,0062) == YES
+  methodText: string | null; // (0012,0063)
+  methodCodes: string[]; // (0012,0064) 代码项
+  groups: AnonGroupStatus[];
+}
+
 // 文件夹导入：序列选择对话框的数据结构（scan_folder_series 返回）
 export interface SeriesBrief {
   studyUid?: string | null;

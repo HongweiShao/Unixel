@@ -114,6 +114,8 @@ const batchAnonMap = reactive<Record<string, string>>(
   Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
 );
 const batchAnonPassword = ref<string>("unixel");
+// 方案A「还原重脱敏」：批量导出 DICOM 时，填入原脱敏密码可还原本工具加密脱敏值后再重脱敏。
+const batchAnonRestorePassword = ref<string>("");
 const batchNiiType = ref<string>("int16");
 const batchNiiSform = ref(true);
 const batchNiiGz = ref(true);
@@ -149,6 +151,7 @@ const niftiTypeHint = computed(() => {
 
 function openBatchConvert() {
   batchOpen.value = true;
+  batchAnonRestorePassword.value = "";
   closeMenu();
 }
 function closeBatchConvert() {
@@ -172,6 +175,7 @@ function buildBatchOptions() {
       transferSyntax: batchTs.value,
       anonRanges,
       password: batchAnonPassword.value,
+      restorePassword: batchAnonRestorePassword.value,
       datatype: "int16",
       writeSform: true,
       gz: true,
@@ -1080,6 +1084,10 @@ onMounted(async () => {
                 <div v-if="batchAnonNeedPassword" class="batch-field">
                   <span class="batch-label">加密密码</span>
                   <input type="text" v-model="batchAnonPassword" :disabled="batchRunning" class="batch-input" placeholder="默认 unixel" />
+                </div>
+                <div class="batch-field">
+                  <span class="batch-label">原密码(还原)</span>
+                  <input type="password" v-model="batchAnonRestorePassword" :disabled="batchRunning" class="batch-input" placeholder="还原已加密脱敏用，留空则直接处理" />
                 </div>
                 <p class="batch-hint">注：自动写入 SoftwareVersions（Unixel），无需手动设置。</p>
               </div>

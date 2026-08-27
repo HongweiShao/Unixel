@@ -2544,6 +2544,7 @@ struct ExportDicomArgs {
     ww: f64,
     anon_ranges: Vec<AnonRangeArg>,
     password: String,
+    restore_password: String, // 方案A：非空时还原本工具加密脱敏后再按本轮策略重脱敏
     output: String,
     multifile: bool,
 }
@@ -2577,6 +2578,31 @@ fn read_f64_attr(obj: &FileDicomObject<InMemDicomObject>, name: &str, default: f
 fn md5_hex(data: &[u8]) -> String {
     let h = Md5::digest(data);
     h.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// 判断字符串是否为 32 位十六进制（即本工具 MD5 摘要产物），用于再脱敏幂等守卫。
+fn is_md5_hex(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 截断字符串至 max 个字符（按 Unicode 字符计），超出追加省略号。
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+/// 解析 "(GGGG,EEEE)" 形式的 Tag 文本（加密映射条目所用格式）。
+fn parse_tag_tuple(s: &str) -> Option<(u16, u16)> {
+    let s = s.trim().trim_start_matches('(').trim_end_matches(')');
+    let mut parts = s.split(',');
+    let g = parts.next()?.trim();
+    let e = parts.next()?.trim();
+    let g = u16::from_str_radix(g, 16).ok()?;
+    let e = u16::from_str_radix(e, 16).ok()?;
+    Some((g, e))
 }
 
 fn to_hex(data: &[u8]) -> String {
@@ -3060,11 +3086,19 @@ fn anonymize_object(
                     obj.remove_element(tag);
                 }
                 "hash" => {
+                    // 幂等守卫：当前值已是 32 位 MD5（本工具先前哈希），跳过避免二次哈希。
+                    if is_md5_hex(cur.as_ref()) {
+                        continue;
+                    }
                     applied_methods.insert("hash");
                     let h = md5_hex(cur.as_bytes());
                     set_tag_str(obj, tag, &h);
                 }
                 "encrypt" => {
+                    // 幂等守卫：当前值已是本工具加密占位符，跳过避免二次加密破坏可还原性。
+                    if cur.as_ref() == "ANONYMIZED-ENCRYPTED" {
+                        continue;
+                    }
                     applied_methods.insert("enc");
                     let ct = aes_gcm_encrypt(&key, cur.as_bytes())?;
                     let tag_str = format!("({:04X},{:04X})", g, e);
@@ -3277,6 +3311,182 @@ fn decrypt_anon(path: String, password: String) -> Result<Vec<AnonDecrypted>, St
     Ok(out)
 }
 
+// ---- 诊断 + 方案A：还原重脱敏 ----
+
+/// 各脱敏标签的当前状态（供前端诊断展示）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnonTagStatus {
+    tag: String,      // (GGGG,EEEE)
+    keyword: String,
+    status: String,   // raw | deleted | md5 | encrypted | missing
+    preview: String,  // 截断后的当前值（用于展示）
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnonGroupStatus {
+    id: String,
+    tags: Vec<AnonTagStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnonDiagnosis {
+    has_unixel_mapping: bool,        // 是否含本工具 UNIXEL 加密标记（可还原）
+    patient_identity_removed: bool,  // (0012,0062) == YES
+    method_text: Option<String>,     // (0012,0063)
+    method_codes: Vec<String>,       // (0012,0064) 各代码项 CodeValue
+    groups: Vec<AnonGroupStatus>,
+}
+
+/// 读取 (0012,0064) DeidentificationMethodCodeSequence 中各项的 CodeValue。
+fn read_deid_codes(obj: &FileDicomObject<InMemDicomObject>) -> Vec<String> {
+    let mut codes = Vec::new();
+    if let Ok(seq_el) = obj.element(Tag(0x0012, 0x0064)) {
+        let val = seq_el.value();
+        if let Some(items) = val.items() {
+            for it in items {
+                if let Some(cv) = it
+                    .element(Tag(0x0008, 0x0100))
+                    .ok()
+                    .and_then(|e| e.to_str().ok())
+                {
+                    codes.push(cv.to_string());
+                }
+            }
+        }
+    }
+    codes
+}
+
+/// 方案A：还原本工具加密脱敏的标签，再用本轮策略重新脱敏。
+/// 仅当 `password` 非空且文件含 UNIXEL 加密标记时生效。
+/// - 逐条解密加密映射，将标签还原为原始值（覆盖当前的 "ANONYMIZED-ENCRYPTED" 占位符）；
+/// - 移除旧 UNIXEL 私有标记 (0099,UNIXEL,01/02/03) 与旧强制脱敏标记 (0012,0062/63/64)，
+///   避免与本轮新策略（可能换方法/密码、或不再脱敏）冲突或误导；
+/// - 返回 true 表示已实际还原，false 表示无需/未还原（无密码或无标记）。
+fn restore_anon_mapping(
+    obj: &mut FileDicomObject<InMemDicomObject>,
+    password: &str,
+) -> Result<bool, String> {
+    if password.is_empty() {
+        return Ok(false);
+    }
+    // 仅当存在本工具加密标记才还原（避免对非本工具加密/未加密文件误改）
+    if obj.private_element(0x0099, "UNIXEL", 0x01).is_err() {
+        return Ok(false);
+    }
+    let (algo, salt, mapping) = read_anon_mapping(obj)?;
+    if algo.trim() != "PBKDF2-HMAC-SHA256;AES-256-GCM" {
+        return Err(format!("不支持的加密算法: {}", algo));
+    }
+    let pw = if password.is_empty() {
+        "unixel"
+    } else {
+        password
+    };
+    let key = derive_key(pw, &salt);
+    let entries = mapping
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or("加密映射缺少 entries 字段")?;
+    let mut restored = 0usize;
+    for e in entries {
+        let tag = e
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let ct_hex = e
+            .get("ct_hex")
+            .and_then(|v| v.as_str())
+            .ok_or("加密条目缺少密文")?;
+        let ct = hex_decode(ct_hex).map_err(|err| format!("密文解析失败（{}）: {}", tag, err))?;
+        let pt = aes_gcm_decrypt(&key, &ct)
+            .map_err(|_| format!("还原失败：密码错误或密文损坏（标签 {}）", tag))?;
+        let value = String::from_utf8_lossy(&pt).to_string();
+        if let Some((g, el)) = parse_tag_tuple(&tag) {
+            set_tag_str(obj, Tag(g, el), &value);
+            restored += 1;
+        }
+    }
+    // 移除旧加密元数据与旧强制脱敏标记
+    // 注：dicom-rs 的 UNIXEL 私有块（首个私有创建者，block=0）实际标签为
+    // 创建者 (0099,0010) 与数据 (0099,0101)/(0099,0102)/(0099,0103)。
+    obj.remove_element(Tag(0x0099, 0x0010));
+    obj.remove_element(Tag(0x0099, 0x0101));
+    obj.remove_element(Tag(0x0099, 0x0102));
+    obj.remove_element(Tag(0x0099, 0x0103));
+    obj.remove_element(Tag(0x0012, 0x0062));
+    obj.remove_element(Tag(0x0012, 0x0063));
+    obj.remove_element(Tag(0x0012, 0x0064));
+    Ok(restored > 0)
+}
+
+/// 诊断单个 DICOM 文件的脱敏状态（方案A 前置步骤）。
+#[tauri::command]
+fn diagnose_anon(path: String) -> Result<AnonDiagnosis, String> {
+    let obj = dicom_object::open_file(&path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
+    let has_unixel_mapping = obj.private_element(0x0099, "UNIXEL", 0x01).is_ok();
+    let patient_identity_removed = obj
+        .element(Tag(0x0012, 0x0062))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.trim() == "YES")
+        .unwrap_or(false);
+    let method_text = obj
+        .element(Tag(0x0012, 0x0063))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.to_string());
+    let method_codes = read_deid_codes(&obj);
+
+    let mut groups = Vec::with_capacity(ANON_GROUPS.len());
+    for g in ANON_GROUPS {
+        let mut tags = Vec::with_capacity(g.tags.len());
+        for &(gg, ee, kw) in g.tags {
+            let tag = Tag(gg, ee);
+            let (status, preview) = match obj
+                .element(tag)
+                .ok()
+                .and_then(|e| e.to_str().ok())
+            {
+                None => ("missing".to_string(), String::new()),
+                Some(v) => {
+                    if v.as_ref() == "ANONYMIZED-ENCRYPTED" {
+                        ("encrypted".to_string(), v.to_string())
+                    } else if is_md5_hex(v.as_ref()) {
+                        ("md5".to_string(), v.to_string())
+                    } else if v.trim().is_empty() {
+                        ("deleted".to_string(), String::new())
+                    } else {
+                        ("raw".to_string(), truncate_str(&v, 40))
+                    }
+                }
+            };
+            tags.push(AnonTagStatus {
+                tag: format!("({:04X},{:04X})", gg, ee),
+                keyword: kw.to_string(),
+                status,
+                preview,
+            });
+        }
+        groups.push(AnonGroupStatus {
+            id: g.id.to_string(),
+            tags,
+        });
+    }
+
+    Ok(AnonDiagnosis {
+        has_unixel_mapping,
+        patient_identity_removed,
+        method_text,
+        method_codes,
+        groups,
+    })
+}
+
 // ---- 单文件写出 ----
 
 #[allow(clippy::too_many_arguments)]
@@ -3297,6 +3507,7 @@ fn write_one_dicom(
     is_merged: bool,
     ranges: &[AnonRangeArg],
     password: &str,
+    restore_password: &str,
     path: &str,
 ) -> Result<(), String> {
     // 传输语法
@@ -3327,6 +3538,12 @@ fn write_one_dicom(
 
     // 软件标识
     set_tag(obj, Tag(0x0018, 0x1020), VR::LO, "Unixel - Hongwei Shao");
+
+    // 方案A：若提供原密码且文件含本工具加密标记，先还原原始值，再按本轮策略重新脱敏
+    // （避免对已加密占位符二次加密、对已删/哈希值重复处理）。
+    if !restore_password.is_empty() {
+        restore_anon_mapping(obj, restore_password)?;
+    }
 
     // 脱敏
     anonymize_object(obj, ranges, password, is_merged)?;
@@ -3440,6 +3657,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
             false,
             &args.anon_ranges,
             &args.password,
+            &args.restore_password,
             &args.output,
         )?;
         written += 1;
@@ -3469,6 +3687,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
                 false,
                 &args.anon_ranges,
                 &args.password,
+                &args.restore_password,
                 &path.to_string_lossy(),
             )?;
             written += 1;
@@ -3503,6 +3722,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
             true,
             &args.anon_ranges,
             &args.password,
+            &args.restore_password,
             &args.output,
         )?;
         written += 1;
@@ -3903,6 +4123,7 @@ struct BatchOptions {
     transfer_syntax: String, // 仅 DICOM 输出：implicit|explicit|rle|htj2k_lossless|htj2k_lossy|jpegls_lossless|jpegls_loss|jpeg
     anon_ranges: Vec<AnonRangeArg>,
     password: String,
+    restore_password: String, // 方案A：非空时还原本工具加密脱敏后再按本轮策略重脱敏
     datatype: String, // 仅 NIfTI 输出：int16|int32|uint16|uint8|float32|float64
     write_sform: bool,
     gz: bool,
@@ -3915,6 +4136,7 @@ impl Default for BatchOptions {
             transfer_syntax: "explicit".into(),
             anon_ranges: Vec::new(),
             password: String::new(),
+            restore_password: String::new(),
             datatype: "int16".into(),
             write_sform: true,
             gz: true,
@@ -4108,6 +4330,7 @@ fn build_dicom_series(
     near: u8,
     anon_ranges: &[AnonRangeArg],
     password: &str,
+    restore_password: &str,
 ) -> Result<Vec<String>, String> {
     // X 轴 = NIfTI i（DICOM 列），Y 轴 = NIfTI j（DICOM 行）；仿射行主序：
     // aff = [ srow_x(4) ; srow_y(4) ; srow_z(4) ; 0 0 0 1 ]
@@ -4231,6 +4454,7 @@ fn build_dicom_series(
             false,
             anon_ranges,
             password,
+            restore_password,
             &p,
         )?;
         written.push(p);
@@ -4283,6 +4507,7 @@ fn nifti_to_dicom_series(src: &str, out_dir: &Path, opts: &BatchOptions) -> Resu
         near,
         &opts.anon_ranges,
         &opts.password,
+        &opts.restore_password,
     )?;
     Ok(format!(
         "已写出 {} 个 DICOM 文件至 {}",
@@ -4426,6 +4651,7 @@ async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<
                     ww: 0.0,
                     anon_ranges: opts.anon_ranges.clone(),
                     password: opts.password.clone(),
+                    restore_password: opts.restore_password.clone(),
                     output: out_dir.to_string_lossy().to_string(),
                     multifile: true,
                 })
@@ -4527,7 +4753,8 @@ pub fn run() {
             export_nifti,
             batch_convert,
             batch_convert_cancel,
-            decrypt_anon
+            decrypt_anon,
+            diagnose_anon
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -4602,6 +4829,97 @@ mod anon_decrypt_tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn anon_restore_then_reanonymize() {
+        // 方案A：加密脱敏 → 用原密码还原 → 按本轮策略重脱敏（可换方法/密码）。
+        let build = || {
+            FileDicomObject::new_empty_with_meta(
+                FileMetaTableBuilder::new()
+                    .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                    .media_storage_sop_instance_uid(&gen_uid())
+                    .transfer_syntax("1.2.840.10008.1.2.1")
+                    .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let enc = vec![AnonRangeArg {
+            id: "patient".to_string(),
+            method: "encrypt".to_string(),
+        }];
+        let del = vec![AnonRangeArg {
+            id: "patient".to_string(),
+            method: "delete".to_string(),
+        }];
+
+        // 第一轮：encrypt（密码 oldpass）
+        let mut obj = build();
+        obj.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Zhang^San"),
+        ));
+        anonymize_object(&mut obj, &enc, "oldpass", false).unwrap();
+        assert_eq!(
+            obj.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "ANONYMIZED-ENCRYPTED"
+        );
+        assert!(obj.private_element(0x0099, "UNIXEL", 0x01).is_ok());
+
+        // 方案A：用原密码还原
+        let restored = restore_anon_mapping(&mut obj, "oldpass").unwrap();
+        assert!(restored, "应已还原");
+        assert_eq!(
+            obj.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "Zhang^San"
+        );
+        // 旧 UNIXEL 私有标记与旧强制脱敏标记应被移除
+        assert!(
+            obj.private_element(0x0099, "UNIXEL", 0x01).is_err(),
+            "还原后应移除 UNIXEL 私有标记"
+        );
+        assert!(
+            obj.element(Tag(0x0012, 0x0062)).is_err(),
+            "还原后应移除旧 (0012,0062)"
+        );
+
+        // 第二轮：delete（与首轮不同方法）
+        anonymize_object(&mut obj, &del, "", false).unwrap();
+        assert!(
+            obj.element_by_name("PatientName").is_err(),
+            "重脱敏 delete 应移除 PatientName"
+        );
+        assert_eq!(
+            obj.element(Tag(0x0012, 0x0062)).unwrap().to_str().unwrap(),
+            "YES"
+        );
+
+        // 错误原密码还原必须失败
+        let mut obj2 = build();
+        obj2.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Wang^Wu"),
+        ));
+        anonymize_object(&mut obj2, &enc, "oldpass", false).unwrap();
+        let bad = restore_anon_mapping(&mut obj2, "wrongpass");
+        assert!(bad.is_err(), "错误原密码还原应失败");
+
+        // 无 UNIXEL 标记时 restore 应为 Ok(false)（不误改未加密文件）
+        let mut obj3 = build();
+        obj3.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Plain^Name"),
+        ));
+        let r3 = restore_anon_mapping(&mut obj3, "whatever").unwrap();
+        assert!(!r3, "无标记时不应还原");
+        assert_eq!(
+            obj3.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "Plain^Name"
+        );
     }
 
     #[test]
