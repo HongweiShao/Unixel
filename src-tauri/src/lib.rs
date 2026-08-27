@@ -2466,13 +2466,23 @@ const ANON_GROUPS: &[AnonGroup] = &[
             (0x0008, 0x009C, "ConsultingPhysicianName"),
         ],
     },
-    // 机构信息类
+    // 机构信息类（StationName 已移至设备组）
     AnonGroup {
         id: "institution",
         tags: &[
             (0x0008, 0x0080, "InstitutionName"),
             (0x0008, 0x0081, "InstitutionAddress"),
             (0x0008, 0x1040, "InstitutionalDepartmentName"),
+        ],
+    },
+    // 设备信息类：General Equipment Module 标识（DICOM PS3.15 设备相关）。
+    // 不含 (0018,1020) SoftwareVersions：后台固定覆写为 "Unixel - Hongwei Shao"（工具签名），不纳入脱敏范围。
+    AnonGroup {
+        id: "device",
+        tags: &[
+            (0x0008, 0x0070, "Manufacturer"),
+            (0x0008, 0x1090, "ManufacturerModelName"),
+            (0x0018, 0x1000, "DeviceSerialNumber"),
             (0x0008, 0x1010, "StationName"),
         ],
     },
@@ -4786,6 +4796,75 @@ mod anon_decrypt_tests {
         assert!(txt.contains("UID regeneration"), "(0012,0063) 应含 UID regeneration: {}", txt);
         assert!(txt.contains("tag deletion"), "(0012,0063) 应含 tag deletion: {}", txt);
         assert!(txt.contains("AES-256-GCM encryption"), "(0012,0063) 应含加密说明: {}", txt);
+    }
+
+    #[test]
+    fn anon_device_group_handled() {
+        // 验证「设备信息」组：(0008,0070)Manufacturer、(0008,1090)ManufacturerModelName、
+        // (0018,1000)DeviceSerialNumber、(0008,1010)StationName。
+        // ① device=delete 时四项被移除并写强制标记；② device=keep 时保留；
+        // ③ StationName 已不再属 institution 组；④ 排除 (0018,1020)SoftwareVersions（后台固定写签名）。
+        let build = || {
+            FileDicomObject::new_empty_with_meta(
+                FileMetaTableBuilder::new()
+                    .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                    .media_storage_sop_instance_uid(&gen_uid())
+                    .transfer_syntax("1.2.840.10008.1.2.1")
+                    .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let put_dev = |obj: &mut FileDicomObject<InMemDicomObject>| {
+            obj.put(InMemElement::new(Tag(0x0008, 0x0070), VR::LO, PrimitiveValue::from("SIEMENS".to_string())));
+            obj.put(InMemElement::new(Tag(0x0008, 0x1090), VR::LO, PrimitiveValue::from("SOMATOM Force".to_string())));
+            obj.put(InMemElement::new(Tag(0x0018, 0x1000), VR::LO, PrimitiveValue::from("SN-12345".to_string())));
+            obj.put(InMemElement::new(Tag(0x0008, 0x1010), VR::SH, PrimitiveValue::from("CT-ROOM-1".to_string())));
+            obj.put(InMemElement::new(Tag(0x0018, 0x1020), VR::LO, PrimitiveValue::from("Syngo VB20".to_string())));
+        };
+
+        // ① delete：四项移除 + 写标记
+        let mut obj = build();
+        put_dev(&mut obj);
+        let ranges = vec![AnonRangeArg { id: "device".to_string(), method: "delete".to_string() }];
+        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+        assert!(obj.element_by_name("Manufacturer").is_err(), "device=delete 应移除 Manufacturer");
+        assert!(obj.element_by_name("ManufacturerModelName").is_err(), "device=delete 应移除 ManufacturerModelName");
+        assert!(obj.element_by_name("DeviceSerialNumber").is_err(), "device=delete 应移除 DeviceSerialNumber");
+        assert!(obj.element_by_name("StationName").is_err(), "device=delete 应移除 StationName");
+        assert_eq!(
+            obj.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
+            "YES"
+        );
+        // SoftwareVersions 不在设备组，应保留
+        assert_eq!(
+            obj.element_by_name("SoftwareVersions").unwrap().to_str().unwrap(),
+            "Syngo VB20"
+        );
+
+        // ② keep：四项保留 + 不写标记
+        let mut obj2 = build();
+        put_dev(&mut obj2);
+        anonymize_object(&mut obj2, &[], "unixel", false).unwrap();
+        assert_eq!(obj2.element_by_name("Manufacturer").unwrap().to_str().unwrap(), "SIEMENS");
+        assert_eq!(obj2.element_by_name("ManufacturerModelName").unwrap().to_str().unwrap(), "SOMATOM Force");
+        assert_eq!(obj2.element_by_name("DeviceSerialNumber").unwrap().to_str().unwrap(), "SN-12345");
+        assert_eq!(obj2.element_by_name("StationName").unwrap().to_str().unwrap(), "CT-ROOM-1");
+        assert!(
+            obj2.element_by_name("PatientIdentityRemoved").is_err(),
+            "全 keep 不应写强制标记"
+        );
+
+        // ③ StationName 已不属 institution 组：仅 institution=delete 时不应移除 StationName
+        let mut obj3 = build();
+        put_dev(&mut obj3);
+        let ranges3 = vec![AnonRangeArg { id: "institution".to_string(), method: "delete".to_string() }];
+        anonymize_object(&mut obj3, &ranges3, "unixel", false).unwrap();
+        assert_eq!(
+            obj3.element_by_name("StationName").unwrap().to_str().unwrap(),
+            "CT-ROOM-1",
+            "StationName 已移至设备组，机构组 delete 不应移除它"
+        );
     }
 }
 
