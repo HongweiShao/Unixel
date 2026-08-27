@@ -81,12 +81,12 @@ const tsOptions = [
   { value: "htj2k_lossy", label: "HTJ2K 有损" },
 ] as const;
 const anonGroups = [
-  { id: "patient", label: "患者" },
-  { id: "institution", label: "机构" },
-  { id: "personnel", label: "人员" },
-  { id: "device", label: "设备" },
+  { id: "patient", label: "患者身份" },
+  { id: "personnel", label: "人员身份" },
+  { id: "institution", label: "机构信息" },
+  { id: "device", label: "设备信息" },
   { id: "datetime", label: "日期时间" },
-  { id: "uid", label: "实例 UID" },
+  { id: "uid", label: "唯一标识" },
   { id: "freetext", label: "自由文本" },
 ] as const;
 const anonMethodOptions = (gid: string) => {
@@ -111,7 +111,7 @@ const niftiTypeOptions = [
 const batchTs = ref<string>("explicit");
 const batchTsDegree = ref<number>(90);
 const batchAnonMap = reactive<Record<string, string>>(
-  Object.fromEntries(anonGroups.map((g) => [g.id, g.id === "uid" ? "regenerate" : "keep"]))
+  Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
 );
 const batchAnonPassword = ref<string>("unixel");
 const batchNiiType = ref<string>("int16");
@@ -1068,12 +1068,14 @@ onMounted(async () => {
                 <span class="batch-degree">{{ batchTsDegree }}</span>
               </div>
               <div class="batch-anon">
-                <div class="batch-anon-title">脱敏分组</div>
-                <div v-for="g in anonGroups" :key="g.id" class="batch-anon-row">
-                  <span class="batch-anon-name">{{ g.label }}</span>
-                  <select v-model="batchAnonMap[g.id]" :disabled="batchRunning" class="batch-select">
-                    <option v-for="m in anonMethodOptions(g.id)" :key="m.value" :value="m.value">{{ m.label }}</option>
-                  </select>
+                <div class="batch-anon-title">脱敏</div>
+                <div class="batch-anon-grid">
+                  <div class="batch-anon-item" v-for="g in anonGroups" :key="g.id">
+                    <span class="batch-anon-name">{{ g.label }}</span>
+                    <select v-model="batchAnonMap[g.id]" :disabled="batchRunning" class="batch-select">
+                      <option v-for="m in anonMethodOptions(g.id)" :key="m.value" :value="m.value">{{ m.label }}</option>
+                    </select>
+                  </div>
                 </div>
                 <div v-if="batchAnonNeedPassword" class="batch-field">
                   <span class="batch-label">加密密码</span>
@@ -1994,6 +1996,8 @@ main {
   border-radius: 6px;
   padding: 6px 8px;
   font-size: 13px;
+  flex: 1;
+  min-width: 0;
   max-width: 320px;
 }
 .batch-degree {
@@ -2018,14 +2022,20 @@ main {
   font-size: 12px;
   color: var(--fg-dim);
 }
-.batch-anon-row {
+.batch-anon-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 18px;
+}
+.batch-anon-item {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 .batch-anon-name {
-  flex: 0 0 72px;
+  flex: 0 0 64px;
   font-size: 13px;
+  color: var(--fg-dim);
 }
 .batch-hint {
   margin: 0;
