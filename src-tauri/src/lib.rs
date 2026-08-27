@@ -2466,13 +2466,14 @@ const ANON_GROUPS: &[AnonGroup] = &[
             (0x0008, 0x009C, "ConsultingPhysicianName"),
         ],
     },
-    // 机构信息类（StationName 已移至设备组）
+    // 机构信息类（StationName 归机构组）
     AnonGroup {
         id: "institution",
         tags: &[
             (0x0008, 0x0080, "InstitutionName"),
             (0x0008, 0x0081, "InstitutionAddress"),
             (0x0008, 0x1040, "InstitutionalDepartmentName"),
+            (0x0008, 0x1010, "StationName"),
         ],
     },
     // 设备信息类：General Equipment Module 标识（DICOM PS3.15 设备相关）。
@@ -2483,7 +2484,6 @@ const ANON_GROUPS: &[AnonGroup] = &[
             (0x0008, 0x0070, "Manufacturer"),
             (0x0008, 0x1090, "ManufacturerModelName"),
             (0x0018, 0x1000, "DeviceSerialNumber"),
-            (0x0008, 0x1010, "StationName"),
         ],
     },
     // 日期时间类：仅 Study/Series/Acquisition 的 Date/Time（不含 ContentDate/ContentTime）
@@ -4801,9 +4801,10 @@ mod anon_decrypt_tests {
     #[test]
     fn anon_device_group_handled() {
         // 验证「设备信息」组：(0008,0070)Manufacturer、(0008,1090)ManufacturerModelName、
-        // (0018,1000)DeviceSerialNumber、(0008,1010)StationName。
-        // ① device=delete 时四项被移除并写强制标记；② device=keep 时保留；
-        // ③ StationName 已不再属 institution 组；④ 排除 (0018,1020)SoftwareVersions（后台固定写签名）。
+        // (0018,1000)DeviceSerialNumber（不含 StationName，其归属机构组）。
+        // ① device=delete 时三项被移除并写强制标记，StationName 因属机构组而保留；
+        // ② device=keep 时保留；③ StationName 现属 institution 组，institution=delete 时应移除；
+        // ④ 排除 (0018,1020)SoftwareVersions（后台固定写签名）。
         let build = || {
             FileDicomObject::new_empty_with_meta(
                 FileMetaTableBuilder::new()
@@ -4823,7 +4824,7 @@ mod anon_decrypt_tests {
             obj.put(InMemElement::new(Tag(0x0018, 0x1020), VR::LO, PrimitiveValue::from("Syngo VB20".to_string())));
         };
 
-        // ① delete：四项移除 + 写标记
+        // ① delete：三项移除 + 写标记；StationName 属机构组，device=delete 时保留
         let mut obj = build();
         put_dev(&mut obj);
         let ranges = vec![AnonRangeArg { id: "device".to_string(), method: "delete".to_string() }];
@@ -4831,7 +4832,11 @@ mod anon_decrypt_tests {
         assert!(obj.element_by_name("Manufacturer").is_err(), "device=delete 应移除 Manufacturer");
         assert!(obj.element_by_name("ManufacturerModelName").is_err(), "device=delete 应移除 ManufacturerModelName");
         assert!(obj.element_by_name("DeviceSerialNumber").is_err(), "device=delete 应移除 DeviceSerialNumber");
-        assert!(obj.element_by_name("StationName").is_err(), "device=delete 应移除 StationName");
+        assert_eq!(
+            obj.element_by_name("StationName").unwrap().to_str().unwrap(),
+            "CT-ROOM-1",
+            "StationName 现属机构组，device=delete 不应移除"
+        );
         assert_eq!(
             obj.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
             "YES"
@@ -4842,7 +4847,7 @@ mod anon_decrypt_tests {
             "Syngo VB20"
         );
 
-        // ② keep：四项保留 + 不写标记
+        // ② keep：三项保留 + 不写标记
         let mut obj2 = build();
         put_dev(&mut obj2);
         anonymize_object(&mut obj2, &[], "unixel", false).unwrap();
@@ -4855,15 +4860,14 @@ mod anon_decrypt_tests {
             "全 keep 不应写强制标记"
         );
 
-        // ③ StationName 已不属 institution 组：仅 institution=delete 时不应移除 StationName
+        // ③ StationName 现属 institution 组：institution=delete 时应被移除
         let mut obj3 = build();
         put_dev(&mut obj3);
         let ranges3 = vec![AnonRangeArg { id: "institution".to_string(), method: "delete".to_string() }];
         anonymize_object(&mut obj3, &ranges3, "unixel", false).unwrap();
-        assert_eq!(
-            obj3.element_by_name("StationName").unwrap().to_str().unwrap(),
-            "CT-ROOM-1",
-            "StationName 已移至设备组，机构组 delete 不应移除它"
+        assert!(
+            obj3.element_by_name("StationName").is_err(),
+            "StationName 现属机构组，机构组 delete 应移除它"
         );
     }
 }
