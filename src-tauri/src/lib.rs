@@ -2545,6 +2545,7 @@ struct ExportDicomArgs {
     anon_ranges: Vec<AnonRangeArg>,
     password: String,
     restore_password: String, // 方案A：非空时还原本工具加密脱敏后再按本轮策略重脱敏
+    force_layered: bool,      // 非空原密码仍要对已加密占位符叠加加密（用户确认后）
     output: String,
     multifile: bool,
 }
@@ -3022,6 +3023,7 @@ fn anonymize_object(
     ranges: &[AnonRangeArg],
     password: &str,
     regenerate_study_series: bool,
+    force_layered: bool,
 ) -> Result<(), String> {
     let need_encrypt = ranges.iter().any(|r| r.method == "encrypt");
     let mut salt = [0u8; 16];
@@ -3096,7 +3098,8 @@ fn anonymize_object(
                 }
                 "encrypt" => {
                     // 幂等守卫：当前值已是本工具加密占位符，跳过避免二次加密破坏可还原性。
-                    if cur.as_ref() == "ANONYMIZED-ENCRYPTED" {
+                    // force_layered=true 时（用户确认叠加加密）则不跳过，直接对占位符再加密一层。
+                    if !force_layered && cur.as_ref() == "ANONYMIZED-ENCRYPTED" {
                         continue;
                     }
                     applied_methods.insert("enc");
@@ -3508,6 +3511,7 @@ fn write_one_dicom(
     ranges: &[AnonRangeArg],
     password: &str,
     restore_password: &str,
+    force_layered: bool,
     path: &str,
 ) -> Result<(), String> {
     // 传输语法
@@ -3541,12 +3545,13 @@ fn write_one_dicom(
 
     // 方案A：若提供原密码且文件含本工具加密标记，先还原原始值，再按本轮策略重新脱敏
     // （避免对已加密占位符二次加密、对已删/哈希值重复处理）。
-    if !restore_password.is_empty() {
+    // force_layered=true 时（用户确认叠加加密）不还原，直接对已加密占位符再加密一层。
+    if !restore_password.is_empty() && !force_layered {
         restore_anon_mapping(obj, restore_password)?;
     }
 
     // 脱敏
-    anonymize_object(obj, ranges, password, is_merged)?;
+    anonymize_object(obj, ranges, password, is_merged, force_layered)?;
 
     // 数据集字节编码器选择（此处的 TS 仅决定「除 PixelData 外各 DICOM 元素的字节编码方式」，
     // 并不替代文件声明的传输语法）：
@@ -3658,6 +3663,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
             &args.anon_ranges,
             &args.password,
             &args.restore_password,
+            args.force_layered,
             &args.output,
         )?;
         written += 1;
@@ -3688,6 +3694,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
                 &args.anon_ranges,
                 &args.password,
                 &args.restore_password,
+                args.force_layered,
                 &path.to_string_lossy(),
             )?;
             written += 1;
@@ -3723,6 +3730,7 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
             &args.anon_ranges,
             &args.password,
             &args.restore_password,
+            args.force_layered,
             &args.output,
         )?;
         written += 1;
@@ -4124,6 +4132,7 @@ struct BatchOptions {
     anon_ranges: Vec<AnonRangeArg>,
     password: String,
     restore_password: String, // 方案A：非空时还原本工具加密脱敏后再按本轮策略重脱敏
+    force_layered: bool,      // 用户确认后对已加密占位符叠加加密
     datatype: String, // 仅 NIfTI 输出：int16|int32|uint16|uint8|float32|float64
     write_sform: bool,
     gz: bool,
@@ -4137,6 +4146,7 @@ impl Default for BatchOptions {
             anon_ranges: Vec::new(),
             password: String::new(),
             restore_password: String::new(),
+            force_layered: false,
             datatype: "int16".into(),
             write_sform: true,
             gz: true,
@@ -4331,6 +4341,7 @@ fn build_dicom_series(
     anon_ranges: &[AnonRangeArg],
     password: &str,
     restore_password: &str,
+    force_layered: bool,
 ) -> Result<Vec<String>, String> {
     // X 轴 = NIfTI i（DICOM 列），Y 轴 = NIfTI j（DICOM 行）；仿射行主序：
     // aff = [ srow_x(4) ; srow_y(4) ; srow_z(4) ; 0 0 0 1 ]
@@ -4455,6 +4466,7 @@ fn build_dicom_series(
             anon_ranges,
             password,
             restore_password,
+            force_layered,
             &p,
         )?;
         written.push(p);
@@ -4508,6 +4520,7 @@ fn nifti_to_dicom_series(src: &str, out_dir: &Path, opts: &BatchOptions) -> Resu
         &opts.anon_ranges,
         &opts.password,
         &opts.restore_password,
+        opts.force_layered,
     )?;
     Ok(format!(
         "已写出 {} 个 DICOM 文件至 {}",
@@ -4652,6 +4665,7 @@ async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<
                     anon_ranges: opts.anon_ranges.clone(),
                     password: opts.password.clone(),
                     restore_password: opts.restore_password.clone(),
+                    force_layered: opts.force_layered,
                     output: out_dir.to_string_lossy().to_string(),
                     multifile: true,
                 })
@@ -4788,7 +4802,7 @@ mod anon_decrypt_tests {
             id: "patient".to_string(),
             method: "encrypt".to_string(),
         }];
-        anonymize_object(&mut obj, &ranges, "secret123", false).expect("脱敏");
+        anonymize_object(&mut obj, &ranges, "secret123", false, false).expect("脱敏");
 
         // 写临时文件后走 decrypt_anon（密码正确）
         let path = std::env::temp_dir().join(format!("unixel_anon_test_{}.dcm", std::process::id()));
@@ -4820,7 +4834,7 @@ mod anon_decrypt_tests {
             VR::PN,
             PrimitiveValue::from("Li^Si"),
         ));
-        anonymize_object(&mut obj2, &ranges, "", false).unwrap();
+        anonymize_object(&mut obj2, &ranges, "", false, false).unwrap();
         let path2 =
             std::env::temp_dir().join(format!("unixel_anon_test2_{}.dcm", std::process::id()));
         obj2.write_to_file(&path2).unwrap();
@@ -4861,7 +4875,7 @@ mod anon_decrypt_tests {
             VR::PN,
             PrimitiveValue::from("Zhang^San"),
         ));
-        anonymize_object(&mut obj, &enc, "oldpass", false).unwrap();
+        anonymize_object(&mut obj, &enc, "oldpass", false, false).unwrap();
         assert_eq!(
             obj.element_by_name("PatientName").unwrap().to_str().unwrap(),
             "ANONYMIZED-ENCRYPTED"
@@ -4886,7 +4900,7 @@ mod anon_decrypt_tests {
         );
 
         // 第二轮：delete（与首轮不同方法）
-        anonymize_object(&mut obj, &del, "", false).unwrap();
+        anonymize_object(&mut obj, &del, "", false, false).unwrap();
         assert!(
             obj.element_by_name("PatientName").is_err(),
             "重脱敏 delete 应移除 PatientName"
@@ -4903,7 +4917,7 @@ mod anon_decrypt_tests {
             VR::PN,
             PrimitiveValue::from("Wang^Wu"),
         ));
-        anonymize_object(&mut obj2, &enc, "oldpass", false).unwrap();
+        anonymize_object(&mut obj2, &enc, "oldpass", false, false).unwrap();
         let bad = restore_anon_mapping(&mut obj2, "wrongpass");
         assert!(bad.is_err(), "错误原密码还原应失败");
 
@@ -4919,6 +4933,77 @@ mod anon_decrypt_tests {
         assert_eq!(
             obj3.element_by_name("PatientName").unwrap().to_str().unwrap(),
             "Plain^Name"
+        );
+    }
+
+    #[test]
+    fn anon_force_layered_reencrypts_placeholder() {
+        // 叠加加密：force_layered=true 时，对已加密占位符再加密一层（用新密码），
+        // 旧映射被覆盖（原密码失效），新密码可解出占位符本身。
+        let build = || {
+            FileDicomObject::new_empty_with_meta(
+                FileMetaTableBuilder::new()
+                    .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                    .media_storage_sop_instance_uid(&gen_uid())
+                    .transfer_syntax("1.2.840.10008.1.2.1")
+                    .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let enc = vec![AnonRangeArg {
+            id: "patient".to_string(),
+            method: "encrypt".to_string(),
+        }];
+
+        // 首轮加密（oldpass）
+        let mut obj = build();
+        obj.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Zhang^San"),
+        ));
+        anonymize_object(&mut obj, &enc, "oldpass", false, false).unwrap();
+        assert_eq!(
+            obj.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "ANONYMIZED-ENCRYPTED"
+        );
+
+        // 非 layered 二次 encrypt：应被幂等守卫跳过，旧映射保留（oldpass 仍可还原）
+        anonymize_object(&mut obj, &enc, "otherpass", false, false).unwrap();
+        let r = restore_anon_mapping(&mut obj, "oldpass").unwrap();
+        assert!(r, "非 layered 不应覆盖旧映射");
+        assert_eq!(
+            obj.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "Zhang^San"
+        );
+
+        // layered：用 newpass 对已加密占位符再加密一层
+        let mut obj2 = build();
+        obj2.put(InMemElement::new(
+            Tag(0x0010, 0x0010),
+            VR::PN,
+            PrimitiveValue::from("Zhang^San"),
+        ));
+        anonymize_object(&mut obj2, &enc, "oldpass", false, false).unwrap();
+        // 二次加密强制叠加
+        anonymize_object(&mut obj2, &enc, "newpass", false, true).unwrap();
+        assert_eq!(
+            obj2.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "ANONYMIZED-ENCRYPTED"
+        );
+        // 旧密码应失效（旧映射被覆盖）
+        assert!(
+            restore_anon_mapping(&mut obj2, "oldpass").is_err(),
+            "叠加加密后旧密码应失效"
+        );
+        // 新密码可解出占位符本身（仅一层可逆）
+        let restored = restore_anon_mapping(&mut obj2, "newpass").unwrap();
+        assert!(restored, "新密码应可还原");
+        assert_eq!(
+            obj2.element_by_name("PatientName").unwrap().to_str().unwrap(),
+            "ANONYMIZED-ENCRYPTED",
+            "叠加后新密码解出的应是占位符本身"
         );
     }
 
@@ -5001,7 +5086,7 @@ mod anon_decrypt_tests {
             id: "uid".to_string(),
             method: "regenerate".to_string(),
         }];
-        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+        anonymize_object(&mut obj, &ranges, "unixel", false, false).unwrap();
 
         assert_eq!(
             obj.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
@@ -5031,7 +5116,7 @@ mod anon_decrypt_tests {
                 .unwrap(),
         );
         obj2.put(InMemElement::new(Tag(0x0010, 0x0010), VR::PN, PrimitiveValue::from("A^B")));
-        anonymize_object(&mut obj2, &[], "unixel", false).unwrap();
+        anonymize_object(&mut obj2, &[], "unixel", false, false).unwrap();
         assert!(
             obj2.element_by_name("PatientIdentityRemoved").is_err(),
             "全 keep 不应写强制标记"
@@ -5052,7 +5137,7 @@ mod anon_decrypt_tests {
             id: "freetext".to_string(),
             method: "delete".to_string(),
         }];
-        anonymize_object(&mut obj3, &ranges3, "unixel", false).unwrap();
+        anonymize_object(&mut obj3, &ranges3, "unixel", false, false).unwrap();
         assert!(
             obj3.element_by_name("StudyDescription").is_err(),
             "自由文本 delete 应移除 StudyDescription"
@@ -5084,7 +5169,7 @@ mod anon_decrypt_tests {
             AnonRangeArg { id: "freetext".to_string(), method: "delete".to_string() },
             AnonRangeArg { id: "patient".to_string(), method: "encrypt".to_string() },
         ];
-        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+        anonymize_object(&mut obj, &ranges, "unixel", false, false).unwrap();
 
         // (0012,0064) 代码序列：应含 UID / DEL / ENC 三项，不含未使用的 HASH
         let seq_el = obj
@@ -5146,7 +5231,7 @@ mod anon_decrypt_tests {
         let mut obj = build();
         put_dev(&mut obj);
         let ranges = vec![AnonRangeArg { id: "device".to_string(), method: "delete".to_string() }];
-        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+        anonymize_object(&mut obj, &ranges, "unixel", false, false).unwrap();
         assert!(obj.element_by_name("Manufacturer").is_err(), "device=delete 应移除 Manufacturer");
         assert!(obj.element_by_name("ManufacturerModelName").is_err(), "device=delete 应移除 ManufacturerModelName");
         assert!(obj.element_by_name("DeviceSerialNumber").is_err(), "device=delete 应移除 DeviceSerialNumber");
@@ -5168,7 +5253,7 @@ mod anon_decrypt_tests {
         // ② keep：三项保留 + 不写标记
         let mut obj2 = build();
         put_dev(&mut obj2);
-        anonymize_object(&mut obj2, &[], "unixel", false).unwrap();
+        anonymize_object(&mut obj2, &[], "unixel", false, false).unwrap();
         assert_eq!(obj2.element_by_name("Manufacturer").unwrap().to_str().unwrap(), "SIEMENS");
         assert_eq!(obj2.element_by_name("ManufacturerModelName").unwrap().to_str().unwrap(), "SOMATOM Force");
         assert_eq!(obj2.element_by_name("DeviceSerialNumber").unwrap().to_str().unwrap(), "SN-12345");
@@ -5182,7 +5267,7 @@ mod anon_decrypt_tests {
         let mut obj3 = build();
         put_dev(&mut obj3);
         let ranges3 = vec![AnonRangeArg { id: "institution".to_string(), method: "delete".to_string() }];
-        anonymize_object(&mut obj3, &ranges3, "unixel", false).unwrap();
+        anonymize_object(&mut obj3, &ranges3, "unixel", false, false).unwrap();
         assert!(
             obj3.element_by_name("StationName").is_err(),
             "StationName 现属机构组，机构组 delete 应移除它"

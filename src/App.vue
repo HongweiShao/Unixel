@@ -176,6 +176,7 @@ function buildBatchOptions() {
       anonRanges,
       password: batchAnonPassword.value,
       restorePassword: batchAnonRestorePassword.value,
+      forceLayered: false,
       datatype: "int16",
       writeSform: true,
       gz: true,
@@ -186,6 +187,7 @@ function buildBatchOptions() {
     transferSyntax: "explicit",
     anonRanges: [],
     password: "",
+    forceLayered: false,
     datatype: batchNiiType.value,
     writeSform: batchNiiSform.value,
     gz: batchNiiGz.value,
@@ -914,7 +916,7 @@ onMounted(async () => {
             {{ listLoading ? "导入中…" : "从文件夹导入" }}
           </button>
           <button :disabled="batchRunning" @click="openBatchConvert">批量转换</button>
-          <button class="ghost" @click="useMock">载入示例体数据（mock）</button>
+          <button class="ghost" @click="useMock">加载示例数据</button>
           <p v-if="error" class="err">⚠ {{ error }}</p>
           <p class="hint">
             支持 DICOM(.dcm)、常规图像(PNG/JPG/TIFF)、NIfTI(.nii/.nii.gz)、HTJ2K(.j2c/.jph)。
@@ -1163,7 +1165,7 @@ onMounted(async () => {
               v-model="anonPwd"
               class="anon-input"
               type="password"
-              placeholder="输入脱敏密码（默认 unixel）"
+              placeholder="输入脱敏密码"
               @keyup.enter="decryptAnon"
             />
             <button class="anon-btn" :disabled="anonDecrypting" @click="decryptAnon">
@@ -1340,6 +1342,7 @@ main {
   border-radius: 6px;
   cursor: pointer;
   font-size: 14px;
+  width: 168px;
 }
 .placeholder button:disabled {
   opacity: 0.6;

@@ -346,6 +346,13 @@ const anonPassword = ref("");
 const anonRestorePassword = ref("");
 const anonDiagnosis = ref<AnonDiagnosis | null>(null);
 const anonDiagnosing = ref(false);
+// 方案A 叠加加密：原始密码为空/错误时，确认后对已加密占位符再加密一层
+const confirmLayeredOpen = ref(false);
+const pendingExport = ref<{
+  output: string;
+  seriesPaths: string[];
+  anonRanges: { id: string; method: string }[];
+} | null>(null);
 
 // 打开导出对话框时诊断当前文件的脱敏状态（方案A 前置）
 watch(exportDicomOpen, async (open) => {
@@ -479,6 +486,21 @@ async function onExportDicom() {
       ? props.seriesPaths ?? []
       : [];
 
+  // 前置确认：检测到本工具加密标记但未提供原始密码 → 询问是否叠加加密
+  if (anonDiagnosis.value?.hasUnixelMapping && anonRestorePassword.value.trim() === "") {
+    pendingExport.value = { output, seriesPaths, anonRanges };
+    confirmLayeredOpen.value = true;
+    return;
+  }
+  await runExport(output, seriesPaths, anonRanges, false);
+}
+
+async function runExport(
+  output: string,
+  seriesPaths: string[],
+  anonRanges: { id: string; method: string }[],
+  forceLayered: boolean
+) {
   exportingDicom.value = true;
   exportDicomMsg.value = null;
   try {
@@ -494,20 +516,42 @@ async function onExportDicom() {
         ww: ww.value,
         anonRanges,
         password: anonPassword.value,
-        restorePassword: anonRestorePassword.value,
+        restorePassword: forceLayered ? "" : anonRestorePassword.value,
+        forceLayered,
         output,
         multifile: exportMultifile.value,
       },
     });
     exportDicomMsg.value = res;
-  } catch (e) {
-    exportDicomMsg.value =
-      "导出失败：" +
-      (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
-  } finally {
-    exportingDicom.value = false;
     exportDicomOpen.value = false;
+  } catch (e) {
+    const msg =
+      typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e);
+    // 原始密码错误 → 询问叠加加密
+    if (
+      !forceLayered &&
+      anonDiagnosis.value?.hasUnixelMapping &&
+      /密码错误/.test(msg)
+    ) {
+      pendingExport.value = { output, seriesPaths, anonRanges };
+      confirmLayeredOpen.value = true;
+      return;
+    }
+    exportDicomMsg.value = "导出失败：" + msg;
+  } finally {
+    if (!confirmLayeredOpen.value) exportingDicom.value = false;
   }
+}
+
+async function confirmLayered() {
+  if (!pendingExport.value) return;
+  const p = pendingExport.value;
+  confirmLayeredOpen.value = false;
+  await runExport(p.output, p.seriesPaths, p.anonRanges, true);
+}
+
+function cancelLayered() {
+  confirmLayeredOpen.value = false;
 }
 
 async function onExportNifti() {
@@ -742,14 +786,14 @@ async function onExportNifti() {
           <span class="modal-label"></span>
           <div class="anon-diag-box" v-if="anonDiagnosis.hasUnixelMapping">
             <p class="anon-diag-note">
-              ✓ 检测到本工具加密脱敏标记（方案A 可用）：输入<strong>原脱敏密码</strong>可还原原始值，再按上方所选方式重新脱敏（可换方法/密码，避免二次加密）。
+              ✓ 已加密脱敏（可还原）。输入<strong>原始密码</strong>可还原后重新脱敏；留空将叠加加密。
             </p>
             <div class="anon-restore-row">
               <input
                 type="password"
                 v-model="anonRestorePassword"
                 class="anon-pwd"
-                placeholder="原脱敏密码（还原用，留空则直接处理当前值）"
+                placeholder="原始密码"
               />
             </div>
           </div>
@@ -775,6 +819,20 @@ async function onExportNifti() {
           <button class="primary" :disabled="exportingDicom" @click="onExportDicom">
             {{ exportingDicom ? "导出中…" : "导出" }}
           </button>
+        </div>
+
+        <div v-if="confirmLayeredOpen" class="anon-confirm-mask" @click.self="cancelLayered">
+          <div class="anon-confirm">
+            <p class="anon-confirm-text">
+              原始密码为空或错误，将对已加密标签<strong>叠加加密</strong>。确认继续？
+            </p>
+            <div class="anon-confirm-actions">
+              <button :disabled="exportingDicom" @click="cancelLayered">取消</button>
+              <button class="primary" :disabled="exportingDicom" @click="confirmLayered">
+                确认叠加
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1164,6 +1222,51 @@ async function onExportNifti() {
 }
 .anon-pwd {
   flex: 1;
+}
+
+/* 叠加加密确认弹窗 */
+.anon-confirm-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  z-index: 10;
+}
+.anon-confirm {
+  background: var(--panel, #23262e);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+  width: 360px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.4);
+}
+.anon-confirm-text {
+  margin: 0 0 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+.anon-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+.anon-confirm-actions button {
+  padding: 7px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+  font-size: 13px;
+}
+.anon-confirm-actions .primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 /* 导出 NIfTI 对话框 */
