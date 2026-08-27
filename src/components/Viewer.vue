@@ -1218,6 +1218,13 @@ async function onExportNifti() {
 .anon-pwd {
   flex: 1;
 }
+.anon-diag-box {
+  flex: 1;
+  min-width: 0;
+}
+.anon-diag-box .anon-pwd {
+  width: 100%;
+}
 
 /* 叠加加密确认弹窗 */
 .anon-confirm-mask {
