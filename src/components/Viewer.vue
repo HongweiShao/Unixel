@@ -401,6 +401,7 @@ const anonGroups = [
   { id: "device", label: "设备" },
   { id: "datetime", label: "日期时间" },
   { id: "uid", label: "实例 UID" },
+  { id: "freetext", label: "自由文本" },
 ] as const;
 // 各分组可选脱敏方式；uid 额外支持「重生成 UID」
 const anonMethodOptions = (gid: string) => {
@@ -415,9 +416,9 @@ const anonMethodOptions = (gid: string) => {
   }
   return base;
 };
-// 当前各分组选定的方式（默认保留）
+// 当前各分组选定的方式（UID 默认重生成；其余默认保留）
 const anonMethodMap = reactive<Record<string, string>>(
-  Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
+  Object.fromEntries(anonGroups.map((g) => [g.id, g.id === "uid" ? "regenerate" : "keep"]))
 );
 const anonNeedPassword = computed(() =>
   Object.values(anonMethodMap).some((m) => m === "encrypt")

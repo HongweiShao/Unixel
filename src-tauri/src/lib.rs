@@ -15,6 +15,7 @@ use ab_glyph::{FontRef, PxScale};
 use dicom_object::{mem::InMemElement, FileDicomObject, FileMetaTableBuilder, InMemDicomObject};
 use dicom_core::{PrimitiveValue, VR};
 use dicom_core::value::{InMemFragment, PixelFragmentSequence, Value};
+use dicom_core::header::Length;
 use dicom_core::value::fragments::Fragments;
 // 传输语法注册表：用于显式以「显式 VR 小端」编码器写出 HTJ2K 等库未注册的压缩传输语法
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
@@ -2441,6 +2442,7 @@ struct AnonGroup {
     tags: &'static [&'static str],
 }
 const ANON_GROUPS: &[AnonGroup] = &[
+    // 患者身份类（CSV）：新增 OtherPatientIDs (0010,1000)；PatientSex 仍属患者身份，保留。
     AnonGroup {
         id: "patient",
         tags: &[
@@ -2450,12 +2452,10 @@ const ANON_GROUPS: &[AnonGroup] = &[
             "PatientSex",
             "PatientAddress",
             "PatientTelephoneNumbers",
+            "OtherPatientIDs",
         ],
     },
-    AnonGroup {
-        id: "institution",
-        tags: &["InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName"],
-    },
+    // 人员身份类（CSV）：新增 ConsultingPhysicianName (0008,009C) 会诊医师。
     AnonGroup {
         id: "personnel",
         tags: &[
@@ -2463,17 +2463,29 @@ const ANON_GROUPS: &[AnonGroup] = &[
             "PerformingPhysicianName",
             "OperatorsName",
             "PhysiciansOfRecord",
+            "ConsultingPhysicianName",
         ],
     },
+    // 机构信息类（CSV）：StationName 由 device 组移入本组（CSV 将其归入机构）。
+    AnonGroup {
+        id: "institution",
+        tags: &[
+            "InstitutionName",
+            "InstitutionAddress",
+            "InstitutionalDepartmentName",
+            "StationName",
+        ],
+    },
+    // 设备类：CSV 未覆盖（无 Manufacturer/Model/SerialNumber），保留为额外组，默认保留。
     AnonGroup {
         id: "device",
         tags: &[
             "Manufacturer",
             "ManufacturerModelName",
             "DeviceSerialNumber",
-            "StationName",
         ],
     },
+    // 日期时间类（CSV）：Study/Series/Acquisition 的 Date/Time；ContentDate/ContentTime 一并处理。
     AnonGroup {
         id: "datetime",
         tags: &[
@@ -2487,9 +2499,30 @@ const ANON_GROUPS: &[AnonGroup] = &[
             "ContentTime",
         ],
     },
+    // 唯一标识符类（CSV）：新增 FrameOfReferenceUID (0020,0052)、AcquisitionUID (0008,0017)、AccessionNumber (0008,0050)。
     AnonGroup {
         id: "uid",
-        tags: &["StudyInstanceUID", "SeriesInstanceUID", "SOPInstanceUID"],
+        tags: &[
+            "StudyInstanceUID",
+            "SeriesInstanceUID",
+            "SOPInstanceUID",
+            "FrameOfReferenceUID",
+            "AcquisitionUID",
+            "AccessionNumber",
+        ],
+    },
+    // 自由文本类（CSV，新增组）：StudyDescription/SeriesDescription/ImageComments/AdditionalPatientHistory/
+    // IdentifyingComments (0008,4000)/AcquisitionProtocolDescription (0018,9424)。
+    AnonGroup {
+        id: "freetext",
+        tags: &[
+            "StudyDescription",
+            "SeriesDescription",
+            "ImageComments",
+            "AdditionalPatientHistory",
+            "IdentifyingComments",
+            "AcquisitionProtocolDescription",
+        ],
     },
 ];
 
@@ -2957,6 +2990,9 @@ fn anonymize_object(
         Vec::new()
     };
     let mut entries: Vec<serde_json::Value> = Vec::new();
+    // applied：是否实际执行了脱敏（任一分组 method 非 keep，含 UID 重生成）。
+    // 用于决定是否写强制脱敏标记 (0012,0062)/(0012,0064)。
+    let mut applied = false;
 
     for group in ANON_GROUPS {
         let method = match ranges.iter().find(|r| r.id == group.id) {
@@ -2966,14 +3002,19 @@ fn anonymize_object(
         if method == "keep" {
             continue;
         }
+        applied = true;
 
-        // UID 组特殊处理：重新生成随机 UID
+        // UID 组特殊处理：一致随机重生成（保持实例间引用；DICOM PS3.15 标准做法）
         if group.id == "uid" && method == "regenerate" {
-            if regenerate_study_series {
-                set_tag_str(obj, "StudyInstanceUID", &gen_uid());
-                set_tag_str(obj, "SeriesInstanceUID", &gen_uid());
+            for &kw in group.tags {
+                // Study/Series UID 仅在「整体重生成」时替换（合并同序列导出时保持分组一致）
+                let skip_study_series =
+                    matches!(kw, "StudyInstanceUID" | "SeriesInstanceUID") && !regenerate_study_series;
+                if skip_study_series {
+                    continue;
+                }
+                set_tag_str(obj, kw, &gen_uid());
             }
-            set_tag_str(obj, "SOPInstanceUID", &gen_uid());
             let new_sop = obj
                 .element_by_name("SOPInstanceUID")
                 .ok()
@@ -3018,6 +3059,45 @@ fn anonymize_object(
                 _ => {}
             }
         }
+    }
+
+    // 强制脱敏标记：只要实际执行了脱敏就写入。
+    // (0012,0062) PatientIdentityRemoved=YES；(0012,0063) DeidentificationMethod 文本；
+    // (0012,0064) DeidentificationMethodCodeSequence 放一个自定义方法代码项。
+    if applied {
+        obj.put(InMemElement::new(
+            Tag(0x0012, 0x0062),
+            VR::CS,
+            PrimitiveValue::from("YES".to_string()),
+        ));
+        obj.put(InMemElement::new(
+            Tag(0x0012, 0x0063),
+            VR::LO,
+            PrimitiveValue::from(
+                "Unixel DICOM de-identification: UID regenerate; optional PBKDF2-HMAC-SHA256/AES-256-GCM encrypt".to_string(),
+            ),
+        ));
+        let mut code_item = InMemDicomObject::new_empty();
+        code_item.put(InMemElement::new(
+            Tag(0x0008, 0x0100),
+            VR::SH,
+            PrimitiveValue::from("UNIXEL-DEID".to_string()),
+        ));
+        code_item.put(InMemElement::new(
+            Tag(0x0008, 0x0102),
+            VR::SH,
+            PrimitiveValue::from("99UNIXEL".to_string()),
+        ));
+        code_item.put(InMemElement::new(
+            Tag(0x0008, 0x0104),
+            VR::LO,
+            PrimitiveValue::from("Unixel DICOM de-identification (custom method)".to_string()),
+        ));
+        obj.put(InMemElement::new(
+            Tag(0x0012, 0x0064),
+            VR::SQ,
+            Value::new_sequence(vec![code_item], Length::UNDEFINED),
+        ));
     }
 
     if !entries.is_empty() {
@@ -4524,6 +4604,96 @@ mod anon_decrypt_tests {
         let (algo, _salt, mapping) = read_anon_mapping(&obj).expect("应容忍尾随 0x00 填充");
         assert_eq!(algo.trim(), "PBKDF2-HMAC-SHA256;AES-256-GCM");
         assert!(mapping.get("entries").and_then(|v| v.as_array()).is_some());
+    }
+
+    #[test]
+    fn anon_markers_uid_regenerate_and_freetext() {
+        // 验证：① 实际脱敏时写强制标记 (0012,0062)/(0012,0064)；
+        // ② UID 重生成保持引用（SOP/FoR/Acquisition/Accession 替换，Study/Series 受 regenerate_study_series 门控）；
+        // ③ 未选中的分组保持原值；④ 全 keep 不写标记；⑤ 自由文本组 delete 生效。
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid(&gen_uid())
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+            .build()
+            .expect("构建文件元表");
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        obj.put(InMemElement::new(Tag(0x0010, 0x0010), VR::PN, PrimitiveValue::from("Zhang^San")));
+        obj.put(InMemElement::new(Tag(0x0020, 0x000D), VR::UI, PrimitiveValue::from("1.2.3.4".to_string())));
+        obj.put(InMemElement::new(Tag(0x0020, 0x000E), VR::UI, PrimitiveValue::from("1.2.3.5".to_string())));
+        let sop0 = "1.2.3.6";
+        obj.put(InMemElement::new(Tag(0x0008, 0x0018), VR::UI, PrimitiveValue::from(sop0.to_string())));
+        obj.put(InMemElement::new(Tag(0x0020, 0x0052), VR::UI, PrimitiveValue::from("1.2.3.7".to_string())));
+        obj.put(InMemElement::new(Tag(0x0008, 0x0017), VR::UI, PrimitiveValue::from("1.2.3.8".to_string())));
+        obj.put(InMemElement::new(Tag(0x0008, 0x0050), VR::SH, PrimitiveValue::from("ACC123".to_string())));
+        obj.put(InMemElement::new(Tag(0x0008, 0x1030), VR::LO, PrimitiveValue::from("Chest CT".to_string())));
+
+        // 仅 UID 重生成（regenerate_study_series=false）
+        let ranges = vec![AnonRangeArg {
+            id: "uid".to_string(),
+            method: "regenerate".to_string(),
+        }];
+        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+
+        assert_eq!(
+            obj.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
+            "YES"
+        );
+        assert!(obj.element_by_name("DeidentificationMethodCodeSequence").is_ok());
+        // Study/Series UID 不变（regenerate_study_series=false）
+        assert_eq!(obj.element_by_name("StudyInstanceUID").unwrap().to_str().unwrap(), "1.2.3.4");
+        assert_eq!(obj.element_by_name("SeriesInstanceUID").unwrap().to_str().unwrap(), "1.2.3.5");
+        // SOP/FoR/Acquisition/Accession 已重生成（值改变）
+        assert_ne!(obj.element_by_name("SOPInstanceUID").unwrap().to_str().unwrap(), sop0);
+        assert_ne!(obj.element_by_name("FrameOfReferenceUID").unwrap().to_str().unwrap(), "1.2.3.7");
+        assert_ne!(obj.element_by_name("AcquisitionUID").unwrap().to_str().unwrap(), "1.2.3.8");
+        assert_ne!(obj.element_by_name("AccessionNumber").unwrap().to_str().unwrap(), "ACC123");
+        // 未被选中的分组保持原值
+        assert_eq!(obj.element_by_name("PatientName").unwrap().to_str().unwrap(), "Zhang^San");
+        assert_eq!(obj.element_by_name("StudyDescription").unwrap().to_str().unwrap(), "Chest CT");
+
+        // 无脱敏（全 keep）时不写标记
+        let mut obj2 = FileDicomObject::new_empty_with_meta(
+            FileMetaTableBuilder::new()
+                .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(&gen_uid())
+                .transfer_syntax("1.2.840.10008.1.2.1")
+                .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                .build()
+                .unwrap(),
+        );
+        obj2.put(InMemElement::new(Tag(0x0010, 0x0010), VR::PN, PrimitiveValue::from("A^B")));
+        anonymize_object(&mut obj2, &[], "unixel", false).unwrap();
+        assert!(
+            obj2.element_by_name("PatientIdentityRemoved").is_err(),
+            "全 keep 不应写强制标记"
+        );
+
+        // 自由文本组 delete 应移除 StudyDescription 并写标记
+        let mut obj3 = FileDicomObject::new_empty_with_meta(
+            FileMetaTableBuilder::new()
+                .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+                .media_storage_sop_instance_uid(&gen_uid())
+                .transfer_syntax("1.2.840.10008.1.2.1")
+                .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+                .build()
+                .unwrap(),
+        );
+        obj3.put(InMemElement::new(Tag(0x0008, 0x1030), VR::LO, PrimitiveValue::from("Chest CT".to_string())));
+        let ranges3 = vec![AnonRangeArg {
+            id: "freetext".to_string(),
+            method: "delete".to_string(),
+        }];
+        anonymize_object(&mut obj3, &ranges3, "unixel", false).unwrap();
+        assert!(
+            obj3.element_by_name("StudyDescription").is_err(),
+            "自由文本 delete 应移除 StudyDescription"
+        );
+        assert_eq!(
+            obj3.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
+            "YES"
+        );
     }
 }
 

@@ -87,6 +87,7 @@ const anonGroups = [
   { id: "device", label: "设备" },
   { id: "datetime", label: "日期时间" },
   { id: "uid", label: "实例 UID" },
+  { id: "freetext", label: "自由文本" },
 ] as const;
 const anonMethodOptions = (gid: string) => {
   const base = [
@@ -110,7 +111,7 @@ const niftiTypeOptions = [
 const batchTs = ref<string>("explicit");
 const batchTsDegree = ref<number>(90);
 const batchAnonMap = reactive<Record<string, string>>(
-  Object.fromEntries(anonGroups.map((g) => [g.id, "keep"]))
+  Object.fromEntries(anonGroups.map((g) => [g.id, g.id === "uid" ? "regenerate" : "keep"]))
 );
 const batchAnonPassword = ref<string>("unixel");
 const batchNiiType = ref<string>("int16");
