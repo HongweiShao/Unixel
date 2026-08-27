@@ -2436,92 +2436,80 @@ const TS_JPEGLS_LOSS: &str = "1.2.840.10008.1.2.4.81";
 // Multiframe Secondary Capture（合并多帧单文件时的 SOP 类，通用安全）
 const MF_SC_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7.4";
 
-// 脱敏范围分组（DICOM keyword）
+// 脱敏范围分组：严格按「脱敏标签.txt」指定的 DICOM Tag 定义（id 与前端 anonGroups 对齐）。
+// 元组为 (group_number, element_number, 显示用 keyword)；keyword 仅用于解密面板展示，不影响脱敏目标 Tag。
 struct AnonGroup {
     id: &'static str,
-    tags: &'static [&'static str],
+    tags: &'static [(u16, u16, &'static str)],
 }
 const ANON_GROUPS: &[AnonGroup] = &[
-    // 患者身份类（CSV）：新增 OtherPatientIDs (0010,1000)；PatientSex 仍属患者身份，保留。
+    // 患者身份类
     AnonGroup {
         id: "patient",
         tags: &[
-            "PatientName",
-            "PatientID",
-            "PatientBirthDate",
-            "PatientSex",
-            "PatientAddress",
-            "PatientTelephoneNumbers",
-            "OtherPatientIDs",
+            (0x0010, 0x0010, "PatientName"),
+            (0x0010, 0x0020, "PatientID"),
+            (0x0010, 0x0030, "PatientBirthDate"),
+            (0x0010, 0x1040, "PatientAddress"),
+            (0x0010, 0x2154, "PatientTelephoneNumbers"),
+            (0x0010, 0x1000, "OtherPatientIDs"),
         ],
     },
-    // 人员身份类（CSV）：新增 ConsultingPhysicianName (0008,009C) 会诊医师。
+    // 人员身份类：注意 (0008,1060) 为 NameOfPhysiciansReadingStudy，非 PhysiciansOfRecord(0008,1048)
     AnonGroup {
         id: "personnel",
         tags: &[
-            "ReferringPhysicianName",
-            "PerformingPhysicianName",
-            "OperatorsName",
-            "PhysiciansOfRecord",
-            "ConsultingPhysicianName",
+            (0x0008, 0x0090, "ReferringPhysicianName"),
+            (0x0008, 0x1050, "PerformingPhysicianName"),
+            (0x0008, 0x1070, "OperatorsName"),
+            (0x0008, 0x1060, "NameOfPhysiciansReadingStudy"),
+            (0x0008, 0x009C, "ConsultingPhysicianName"),
         ],
     },
-    // 机构信息类（CSV）：StationName 由 device 组移入本组（CSV 将其归入机构）。
+    // 机构信息类
     AnonGroup {
         id: "institution",
         tags: &[
-            "InstitutionName",
-            "InstitutionAddress",
-            "InstitutionalDepartmentName",
-            "StationName",
+            (0x0008, 0x0080, "InstitutionName"),
+            (0x0008, 0x0081, "InstitutionAddress"),
+            (0x0008, 0x1040, "InstitutionalDepartmentName"),
+            (0x0008, 0x1010, "StationName"),
         ],
     },
-    // 设备类：CSV 未覆盖（无 Manufacturer/Model/SerialNumber），保留为额外组，默认保留。
-    AnonGroup {
-        id: "device",
-        tags: &[
-            "Manufacturer",
-            "ManufacturerModelName",
-            "DeviceSerialNumber",
-        ],
-    },
-    // 日期时间类（CSV）：Study/Series/Acquisition 的 Date/Time；ContentDate/ContentTime 一并处理。
+    // 日期时间类：仅 Study/Series/Acquisition 的 Date/Time（不含 ContentDate/ContentTime）
     AnonGroup {
         id: "datetime",
         tags: &[
-            "StudyDate",
-            "StudyTime",
-            "SeriesDate",
-            "SeriesTime",
-            "AcquisitionDate",
-            "AcquisitionTime",
-            "ContentDate",
-            "ContentTime",
+            (0x0008, 0x0020, "StudyDate"),
+            (0x0008, 0x0030, "StudyTime"),
+            (0x0008, 0x0022, "AcquisitionDate"),
+            (0x0008, 0x0032, "AcquisitionTime"),
+            (0x0008, 0x0021, "SeriesDate"),
+            (0x0008, 0x0031, "SeriesTime"),
         ],
     },
-    // 唯一标识符类（CSV）：新增 FrameOfReferenceUID (0020,0052)、AcquisitionUID (0008,0017)、AccessionNumber (0008,0050)。
+    // 唯一标识类
     AnonGroup {
         id: "uid",
         tags: &[
-            "StudyInstanceUID",
-            "SeriesInstanceUID",
-            "SOPInstanceUID",
-            "FrameOfReferenceUID",
-            "AcquisitionUID",
-            "AccessionNumber",
+            (0x0020, 0x000D, "StudyInstanceUID"),
+            (0x0020, 0x000E, "SeriesInstanceUID"),
+            (0x0008, 0x0018, "SOPInstanceUID"),
+            (0x0020, 0x0052, "FrameOfReferenceUID"),
+            (0x0008, 0x0017, "AcquisitionUID"),
+            (0x0008, 0x0050, "AccessionNumber"),
         ],
     },
-    // 自由文本类（CSV，新增组）：StudyDescription/SeriesDescription/ImageComments/AdditionalPatientHistory/
-    // IdentifyingComments (0008,4000)/AcquisitionProtocolDescription (0018,9424)。
+    // 自由文本类
     AnonGroup {
         id: "freetext",
         tags: &[
-            "StudyDescription",
-            "SeriesDescription",
-            "ImageComments",
-            "AdditionalPatientHistory",
-            "IdentifyingComments",
-            "AcquisitionProtocolDescription",
+            (0x0008, 0x1030, "StudyDescription"),
+            (0x0008, 0x103E, "SeriesDescription"),
+            (0x0020, 0x4000, "ImageComments"),
+            (0x0010, 0x21B0, "AdditionalPatientHistory"),
+            (0x0008, 0x4000, "IdentifyingComments"),
+            (0x0018, 0x9424, "AcquisitionProtocolDescription"),
         ],
     },
 ];
@@ -2646,12 +2634,32 @@ fn set_tag(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, vr: VR, val: &
     obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
 }
 
-fn set_tag_str(obj: &mut FileDicomObject<InMemDicomObject>, kw: &str, val: &str) {
-    if let Some(el) = obj.element_by_name(kw).ok() {
-        let tag = el.tag();
+fn set_tag_str(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, val: &str) {
+    if let Some(el) = obj.element(tag).ok() {
         let vr = el.vr();
         obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
     }
+}
+
+/// 构造 (0012,0064) DeidentificationMethodCodeSequence 的单个代码项（自定义设计符 99UNIXEL）。
+fn deid_code_item(code_value: &str, code_meaning: &str) -> InMemDicomObject {
+    let mut item = InMemDicomObject::new_empty();
+    item.put(InMemElement::new(
+        Tag(0x0008, 0x0100),
+        VR::SH,
+        PrimitiveValue::from(code_value.to_string()),
+    ));
+    item.put(InMemElement::new(
+        Tag(0x0008, 0x0102),
+        VR::SH,
+        PrimitiveValue::from("99UNIXEL".to_string()),
+    ));
+    item.put(InMemElement::new(
+        Tag(0x0008, 0x0104),
+        VR::LO,
+        PrimitiveValue::from(code_meaning.to_string()),
+    ));
+    item
 }
 
 // ---- 像素提取（保留原始像素，不套 Modality LUT）----
@@ -2993,6 +3001,8 @@ fn anonymize_object(
     // applied：是否实际执行了脱敏（任一分组 method 非 keep，含 UID 重生成）。
     // 用于决定是否写强制脱敏标记 (0012,0062)/(0012,0064)。
     let mut applied = false;
+    // applied_methods：记录本次实际采用的方法类型，用于写 (0012,0063) 文本与 (0012,0064) 代码项。
+    let mut applied_methods: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
 
     for group in ANON_GROUPS {
         let method = match ranges.iter().find(|r| r.id == group.id) {
@@ -3006,17 +3016,17 @@ fn anonymize_object(
 
         // UID 组特殊处理：一致随机重生成（保持实例间引用；DICOM PS3.15 标准做法）
         if group.id == "uid" && method == "regenerate" {
-            for &kw in group.tags {
+            applied_methods.insert("uid");
+            for &(g, e, _kw) in group.tags {
+                let tag = Tag(g, e);
                 // Study/Series UID 仅在「整体重生成」时替换（合并同序列导出时保持分组一致）
-                let skip_study_series =
-                    matches!(kw, "StudyInstanceUID" | "SeriesInstanceUID") && !regenerate_study_series;
-                if skip_study_series {
+                if (tag == Tag(0x0020, 0x000D) || tag == Tag(0x0020, 0x000E)) && !regenerate_study_series {
                     continue;
                 }
-                set_tag_str(obj, kw, &gen_uid());
+                set_tag_str(obj, tag, &gen_uid());
             }
             let new_sop = obj
-                .element_by_name("SOPInstanceUID")
+                .element(Tag(0x0008, 0x0018))
                 .ok()
                 .and_then(|e| e.to_str().ok())
                 .unwrap_or_default();
@@ -3024,37 +3034,36 @@ fn anonymize_object(
             continue;
         }
 
-        for &kw in group.tags {
+        for &(g, e, kw) in group.tags {
+            let tag = Tag(g, e);
             let cur = match obj
-                .element_by_name(kw)
+                .element(tag)
                 .ok()
-                .and_then(|e| e.to_str().ok())
+                .and_then(|el| el.to_str().ok())
             {
                 Some(s) => s,
                 None => continue,
             };
             match method {
                 "delete" => {
-                    obj.remove_element_by_name(kw).ok();
+                    applied_methods.insert("del");
+                    obj.remove_element(tag);
                 }
                 "hash" => {
+                    applied_methods.insert("hash");
                     let h = md5_hex(cur.as_bytes());
-                    set_tag_str(obj, kw, &h);
+                    set_tag_str(obj, tag, &h);
                 }
                 "encrypt" => {
+                    applied_methods.insert("enc");
                     let ct = aes_gcm_encrypt(&key, cur.as_bytes())?;
-                    let t = obj
-                        .element_by_name(kw)
-                        .ok()
-                        .map(|e| e.tag())
-                        .unwrap_or(Tag(0, 0));
-                    let tag_str = format!("({:04X},{:04X})", t.group(), t.element());
+                    let tag_str = format!("({:04X},{:04X})", g, e);
                     entries.push(serde_json::json!({
                         "tag": tag_str,
                         "kw": kw,
                         "ct_hex": to_hex(&ct),
                     }));
-                    set_tag_str(obj, kw, "ANONYMIZED-ENCRYPTED");
+                    set_tag_str(obj, tag, "ANONYMIZED-ENCRYPTED");
                 }
                 _ => {}
             }
@@ -3062,41 +3071,71 @@ fn anonymize_object(
     }
 
     // 强制脱敏标记：只要实际执行了脱敏就写入。
-    // (0012,0062) PatientIdentityRemoved=YES；(0012,0063) DeidentificationMethod 文本；
-    // (0012,0064) DeidentificationMethodCodeSequence 放一个自定义方法代码项。
+    // (0012,0062) PatientIdentityRemoved=YES；
+    // (0012,0063) DeidentificationMethod 文本（汇总本次实际采用的方法）；
+    // (0012,0064) DeidentificationMethodCodeSequence 按实际方法写入对应代码项（自定义设计符 99UNIXEL）。
     if applied {
         obj.put(InMemElement::new(
             Tag(0x0012, 0x0062),
             VR::CS,
             PrimitiveValue::from("YES".to_string()),
         ));
+
+        // (0012,0063) 文本：汇总本次实际方法
+        let mut labels: Vec<&str> = Vec::new();
+        if applied_methods.contains("uid") {
+            labels.push("UID regeneration");
+        }
+        if applied_methods.contains("enc") {
+            labels.push("AES-256-GCM encryption");
+        }
+        if applied_methods.contains("hash") {
+            labels.push("MD5 hashing");
+        }
+        if applied_methods.contains("del") {
+            labels.push("tag deletion");
+        }
+        let method_text = if labels.is_empty() {
+            "Unixel DICOM de-identification".to_string()
+        } else {
+            format!("Unixel DICOM de-identification: {}", labels.join(", "))
+        };
         obj.put(InMemElement::new(
             Tag(0x0012, 0x0063),
             VR::LO,
-            PrimitiveValue::from(
-                "Unixel DICOM de-identification: UID regenerate; optional PBKDF2-HMAC-SHA256/AES-256-GCM encrypt".to_string(),
-            ),
+            PrimitiveValue::from(method_text),
         ));
-        let mut code_item = InMemDicomObject::new_empty();
-        code_item.put(InMemElement::new(
-            Tag(0x0008, 0x0100),
-            VR::SH,
-            PrimitiveValue::from("UNIXEL-DEID".to_string()),
-        ));
-        code_item.put(InMemElement::new(
-            Tag(0x0008, 0x0102),
-            VR::SH,
-            PrimitiveValue::from("99UNIXEL".to_string()),
-        ));
-        code_item.put(InMemElement::new(
-            Tag(0x0008, 0x0104),
-            VR::LO,
-            PrimitiveValue::from("Unixel DICOM de-identification (custom method)".to_string()),
-        ));
+
+        // (0012,0064) 代码序列：按实际方法逐项写入
+        let mut items: Vec<InMemDicomObject> = Vec::new();
+        if applied_methods.contains("uid") {
+            items.push(deid_code_item(
+                "UNIXEL-ANON-UID",
+                "Unixel de-identification: UID regenerated",
+            ));
+        }
+        if applied_methods.contains("enc") {
+            items.push(deid_code_item(
+                "UNIXEL-ANON-ENC",
+                "Unixel de-identification: AES-256-GCM encryption",
+            ));
+        }
+        if applied_methods.contains("hash") {
+            items.push(deid_code_item(
+                "UNIXEL-ANON-HASH",
+                "Unixel de-identification: MD5 hash",
+            ));
+        }
+        if applied_methods.contains("del") {
+            items.push(deid_code_item(
+                "UNIXEL-ANON-DEL",
+                "Unixel de-identification: tag deleted",
+            ));
+        }
         obj.put(InMemElement::new(
             Tag(0x0012, 0x0064),
             VR::SQ,
-            Value::new_sequence(vec![code_item], Length::UNDEFINED),
+            Value::new_sequence(items, Length::UNDEFINED),
         ));
     }
 
@@ -4694,6 +4733,59 @@ mod anon_decrypt_tests {
             obj3.element_by_name("PatientIdentityRemoved").unwrap().to_str().unwrap(),
             "YES"
         );
+    }
+
+    #[test]
+    fn anon_markers_reflect_actual_methods() {
+        // 验证 (0012,0064) 按实际采用的方法写入对应代码项，(0012,0063) 文本汇总实际方法。
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid(SC_IMAGE_STORAGE)
+            .media_storage_sop_instance_uid(&gen_uid())
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .implementation_class_uid(UNIXEL_IMPL_CLASS_UID)
+            .build()
+            .expect("构建文件元表");
+        let mut obj = FileDicomObject::new_empty_with_meta(meta);
+        obj.put(InMemElement::new(Tag(0x0010, 0x0010), VR::PN, PrimitiveValue::from("Zhang^San")));
+        obj.put(InMemElement::new(Tag(0x0020, 0x000D), VR::UI, PrimitiveValue::from("1.2.3.4".to_string())));
+        obj.put(InMemElement::new(Tag(0x0008, 0x0018), VR::UI, PrimitiveValue::from("1.2.3.6".to_string())));
+        obj.put(InMemElement::new(Tag(0x0008, 0x1030), VR::LO, PrimitiveValue::from("Chest CT".to_string())));
+
+        let ranges = vec![
+            AnonRangeArg { id: "uid".to_string(), method: "regenerate".to_string() },
+            AnonRangeArg { id: "freetext".to_string(), method: "delete".to_string() },
+            AnonRangeArg { id: "patient".to_string(), method: "encrypt".to_string() },
+        ];
+        anonymize_object(&mut obj, &ranges, "unixel", false).unwrap();
+
+        // (0012,0064) 代码序列：应含 UID / DEL / ENC 三项，不含未使用的 HASH
+        let seq_el = obj
+            .element_by_name("DeidentificationMethodCodeSequence")
+            .expect("应写 (0012,0064) 代码序列");
+        let items = seq_el.value().items().expect("代码序列应可读");
+        let mut codes: Vec<String> = Vec::new();
+        for it in items {
+            if let Ok(el) = it.element(Tag(0x0008, 0x0100)) {
+                if let Ok(cv) = el.to_str() {
+                    codes.push(cv.to_string());
+                }
+            }
+        }
+        assert!(codes.iter().any(|c| c == "UNIXEL-ANON-UID"), "应含 UID 代码项: {:?}", codes);
+        assert!(codes.iter().any(|c| c == "UNIXEL-ANON-DEL"), "应含删除代码项: {:?}", codes);
+        assert!(codes.iter().any(|c| c == "UNIXEL-ANON-ENC"), "应含加密代码项: {:?}", codes);
+        assert!(!codes.iter().any(|c| c == "UNIXEL-ANON-HASH"), "未用哈希不应含 HASH 代码项: {:?}", codes);
+
+        // (0012,0063) 文本汇总实际方法
+        let txt = obj
+            .element_by_name("DeidentificationMethod")
+            .expect("应写 (0012,0063) 文本")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(txt.contains("UID regeneration"), "(0012,0063) 应含 UID regeneration: {}", txt);
+        assert!(txt.contains("tag deletion"), "(0012,0063) 应含 tag deletion: {}", txt);
+        assert!(txt.contains("AES-256-GCM encryption"), "(0012,0063) 应含加密说明: {}", txt);
     }
 }
 

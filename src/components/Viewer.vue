@@ -398,7 +398,6 @@ const anonGroups = [
   { id: "patient", label: "患者身份" },
   { id: "personnel", label: "人员身份" },
   { id: "institution", label: "机构信息" },
-  { id: "device", label: "设备信息" },
   { id: "datetime", label: "日期时间" },
   { id: "uid", label: "唯一标识" },
   { id: "freetext", label: "自由文本" },
