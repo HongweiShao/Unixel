@@ -16,11 +16,11 @@ export interface DicomMeta {
   huMax: number;
 }
 
-// 后端 load_dicom 返回的整体结构：元数据 + 连续 f32 像素字节
+// 前端组装的 DICOM 图像结构：元数据 + 连续 f32 像素字节。
+// 后端以两个命令返回：load_dicom_meta（JSON 元数据）与 load_dicom_pixels（二进制 ArrayBuffer 像素）。
 export interface DicomImage {
   meta: DicomMeta;
-  // 经 Tauri v2 JSON IPC：serde_bytes 的 Vec<u8> 会退化为 number[]（需转回 Uint8Array）；
-  // 也可能是 base64 字符串或真正的 Uint8Array，decodePixelBytes 统一兼容。
+  // 二进制通道（responseType:'binary'）返回时即为 Uint8Array；decodePixelBytes 仍兼容历史 number[]/base64。
   pixelBytes: Uint8Array | string | number[];
 }
 

@@ -30,10 +30,11 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use nifti::{NiftiObject, ReaderOptions};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DicomMeta {
     path: String,
@@ -52,7 +53,7 @@ struct DicomMeta {
     hu_max: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DicomImage {
     meta: DicomMeta,
@@ -913,9 +914,54 @@ fn apply_window_rust(hu: &[f32], wc: f64, ww: f64, invert: bool, out: &mut [u8])
 
 // ---------- Tauri commands ----------
 
+// 切片像素解码缓存：load_dicom_meta 与 load_dicom_pixels 共享同一次解码结果，
+// 避免"取元数据"与"取像素"两次调用重复解码；有界 LRU 防止大量切片常驻内存。
+struct DecodedCache {
+    inner: Mutex<VecDeque<(String, Arc<DicomImage>)>>,
+    cap: usize,
+}
+static DECODE_CACHE: OnceLock<DecodedCache> = OnceLock::new();
+fn decode_cache() -> &'static DecodedCache {
+    DECODE_CACHE.get_or_init(|| DecodedCache {
+        inner: Mutex::new(VecDeque::new()),
+        cap: 16,
+    })
+}
+fn cache_get(path: &str) -> Option<Arc<DicomImage>> {
+    let g = decode_cache().inner.lock().unwrap();
+    g.iter().find(|(p, _)| p == path).map(|(_, v)| v.clone())
+}
+fn cache_put(path: String, img: Arc<DicomImage>) {
+    let c = decode_cache();
+    let mut g = c.inner.lock().unwrap();
+    if g.iter().any(|(p, _)| p == &path) {
+        return;
+    }
+    g.push_back((path, img));
+    while g.len() > c.cap {
+        g.pop_front();
+    }
+}
+fn decode_or_cache(path: &str) -> Result<Arc<DicomImage>, String> {
+    if let Some(a) = cache_get(path) {
+        return Ok(a);
+    }
+    let img = decode_dicom_file(path)?;
+    let a = Arc::new(img);
+    cache_put(path.to_string(), a.clone());
+    Ok(a)
+}
+
+/// 仅返回元数据（不含像素）。切片滚动时先取 meta（极小 JSON），像素按需经二进制通道获取。
 #[tauri::command]
-fn load_dicom(path: String) -> Result<DicomImage, String> {
-    decode_dicom_file(&path)
+fn load_dicom_meta(path: String) -> Result<DicomMeta, String> {
+    Ok(decode_or_cache(&path)?.meta.clone())
+}
+
+/// 返回像素原始字节（f32 LE，长度 = width*height*frames*4），走二进制响应避免 JSON number[] 膨胀。
+#[tauri::command]
+fn load_dicom_pixels(path: String) -> Result<tauri::ipc::Response, String> {
+    Ok(tauri::ipc::Response::new(decode_or_cache(&path)?.pixel_bytes.clone()))
 }
 
 #[tauri::command]
@@ -4752,7 +4798,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             greet,
-            load_dicom,
+            load_dicom_meta,
+            load_dicom_pixels,
             load_image,
             load_nifti,
             load_htj2k,

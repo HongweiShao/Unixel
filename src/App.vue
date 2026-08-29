@@ -291,8 +291,17 @@ function infoFromMeta(m: DicomMeta, path: string, kind: string): ImageInfo {
 async function loadByKind(path: string, kind: string): Promise<ImageView> {
   let img: DicomImage;
   if (kind === "htj2k") img = await invoke<DicomImage>("load_htj2k", { path });
-  else if (kind === "dicom") img = await invoke<DicomImage>("load_dicom", { path });
-  else img = await invoke<DicomImage>("load_image", { path });
+  else if (kind === "dicom") {
+    // 二进制像素传输：meta 走 JSON（极小），像素经 responseType:'binary' 取 ArrayBuffer，
+    // 避免 Tauri 默认把 Vec<u8> 序列化为 number[]（大切片可达数百万数字，解析极慢）。
+    const meta = await invoke<DicomMeta>("load_dicom_meta", { path });
+    const buf = (await invoke(
+      "load_dicom_pixels",
+      { path },
+      { responseType: "binary" } as any,
+    )) as unknown as ArrayBuffer;
+    img = { meta, pixelBytes: new Uint8Array(buf) };
+  } else img = await invoke<DicomImage>("load_image", { path });
   return toImageView(img);
 }
 
@@ -458,8 +467,7 @@ async function loadSeries(series: SeriesBrief) {
     imageList.value = list;
     activeId.value = list[0].id;
     clearNifti();
-    await decodeItem(list[0]);
-    currentView.value = list[0].view;
+    await decodeInto(list[0]);
   } catch (e) {
     error.value =
       typeof e === "string"
@@ -491,33 +499,105 @@ const seriesFiles = computed(() => {
 // 当前系列有序完整文件路径（"所有"导出时逐片传给后端）
 const seriesPaths = computed(() => seriesFiles.value.map((i) => i.info.path));
 
-// 解码单个图像像素（不触碰导入 spinner，供滚动按需调用，结果缓存到 item.view）
-async function decodeItem(item: OpenedImage) {
-  if (item.view) return;
-  item.view = await loadByKind(item.info.path, item.info.kind);
+// 解码单个图像像素并上台显示，同时后台预取相邻切片（结果缓存到 item.view）。
+async function decodeInto(item: OpenedImage): Promise<void> {
+  if (item.view) {
+    currentView.value = item.view;
+    prefetchNeighbors(item.id);
+    return;
+  }
+  const img = await loadByKind(item.info.path, item.info.kind);
+  item.view = img;
+  currentView.value = img;
+  prefetchNeighbors(item.id);
 }
 
-// 切换激活图像：已解码则即时切换；未解码则在后台解码，期间保留上一帧显示
-// （Viewer 常驻不复挂载，currentView 始终非 null → 绝不闪烁）。
+// 计算同系列内 ±k 个相邻切片 id（按 seriesFiles 顺序）。
+function neighborIds(id: number, k: number): number[] {
+  const ids = seriesFiles.value.map((s) => s.id);
+  const idx = ids.indexOf(id);
+  if (idx < 0) return [];
+  const out: number[] = [];
+  for (let d = -k; d <= k; d++) {
+    if (d === 0) continue;
+    const j = idx + d;
+    if (j >= 0 && j < ids.length) out.push(ids[j]);
+  }
+  return out;
+}
+
+// 预取相邻切片：后台解码写缓存（不切换 currentView），拖动到时即瞬时显示。
+function prefetchNeighbors(id: number) {
+  for (const nid of neighborIds(id, 2)) {
+    const it = imageList.value.find((i) => i.id === nid);
+    if (it && !it.view) {
+      loadByKind(it.info.path, it.info.kind)
+        .then((v) => {
+          it.view = v;
+        })
+        .catch(() => {});
+    }
+  }
+}
+
+// 切片解码调度：选中即时更新（滚动条缩略块实时跟随）；解码采用「单飞 + 合并」策略——
+// 同一时刻只解码一片，快速拖动只保留落点切片，杜绝重复/并发解码挤占 CPU。
+// 解码期间保留上一帧显示（currentView 常驻）→ Viewer 绝不闪烁。
+let decodeInFlight = false;
+let pendingDecodeId: number | null = null;
+
 function selectImage(id: number) {
   if (id === activeId.value && currentView.value) return;
-  activeId.value = id;
+  activeId.value = id; // 立即更新选中，缩略块实时跟随
   closeMenu();
+  ensureDecode(id);
+}
+
+function ensureDecode(id: number) {
   const item = imageList.value.find((i) => i.id === id);
   if (!item) return;
   if (item.view) {
     currentView.value = item.view;
+    prefetchNeighbors(id);
     return;
   }
+  if (decodeInFlight) {
+    pendingDecodeId = id; // 拖动中：只记最新落点，待当前解码完成后继续
+    return;
+  }
+  startDecode(id);
+}
+
+function startDecode(id: number) {
+  const item = imageList.value.find((i) => i.id === id);
+  if (!item) return;
+  if (item.view) {
+    currentView.value = item.view;
+    prefetchNeighbors(id);
+    return;
+  }
+  decodeInFlight = true;
   const seq = ++loadSeq;
-  decodeItem(item)
+  decodeInto(item)
     .then(() => {
-      if (seq !== loadSeq) return; // 已被更新的切换请求取代，丢弃陈旧结果
-      const it = imageList.value.find((i) => i.id === id);
-      if (it?.view) currentView.value = it.view;
+      decodeInFlight = false;
+      if (seq !== loadSeq) return;
+      // 合并：拖动期间又请求了其他切片，继续解码最新落点
+      if (pendingDecodeId !== null && pendingDecodeId !== id) {
+        const p = pendingDecodeId;
+        pendingDecodeId = null;
+        startDecode(p);
+      }
     })
     .catch((e) => {
+      decodeInFlight = false;
       if (seq !== loadSeq) return;
+      if (pendingDecodeId !== null && pendingDecodeId !== id) {
+        const p = pendingDecodeId;
+        pendingDecodeId = null;
+        startDecode(p);
+        return;
+      }
       error.value =
         typeof e === "string"
           ? e
