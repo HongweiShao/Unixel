@@ -1703,6 +1703,9 @@ main {
 }
 .modal.details {
   width: min(760px, 92vw);
+  /* 固定高度（而非仅 max-height）：否则搜索过滤后行数变少，弹性子项 .details-body
+     随之收缩，对话框会跟着「变矮」。固定高度可保证搜索前后高度恒定。 */
+  height: 82vh;
   max-height: 82vh;
   display: flex;
   flex-direction: column;
@@ -1711,6 +1714,7 @@ main {
 }
 /* 标题栏：与导出对话框 .modal-title 风格一致（底色比内容区 --panel 略深一档，低对比区分） */
 .details-head {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -1834,6 +1838,10 @@ main {
   color: #cdd2ff;
 }
 .details-body {
+  /* flex:1 + min-height:0 让 body 吃掉固定高度下的剩余空间并自行滚动；
+     缺少 min-height:0 时 flex 子项不会收缩，内容溢出会顶开对话框。 */
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   padding: 0;
 }
@@ -1848,6 +1856,7 @@ main {
 }
 /* 加密脱敏解密面板（文件标签信息对话框内） */
 .anon-decrypt {
+  flex: 0 0 auto;
   border-bottom: 1px solid var(--border);
   background: var(--bg);
   padding: 10px 14px;

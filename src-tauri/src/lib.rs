@@ -1634,6 +1634,14 @@ fn tag_explanation(keyword: &str) -> Option<&'static str> {
         "ImageComments" => "图像注释自由文本。",
         "IssueDateOfFilm" => "胶片制作日期。",
         "InterpretationAuthor" => "报告/注解作者。",
+        // —— 文件元信息（0002 组，位于数据集之前，由文件头解析而来，不在数据集迭代范围内）——
+        "FileMetaInformationVersion" => "文件元信息版本号（2 字节），DICOM 固定为 0x00 0x01。",
+        "MediaStorageSOPClassUID" => "媒体存储 SOP 类 UID，标识本文件的 IOD 类型（如 CT Image Storage、Secondary Capture Image Storage）。",
+        "MediaStorageSOPInstanceUID" => "媒体存储 SOP 实例 UID，应与数据集中的 SOPInstanceUID 一致。",
+        "ImplementationClassUID" => "实现（生成本文件的软件/厂商）类 UID。",
+        "ImplementationVersionName" => "生成本文件的软件版本名称（如 “UNIXEL_1.35”）。",
+        "SourceApplicationEntityTitle" => "来源应用实体标题（AE），标识本文件的原始来源系统。",
+        "PrivateInformationCreatorUID" => "私有信息创建者 UID，用于界定文件元信息中私有数据的归属。",
         _ => return None,
     };
     Some(s)
@@ -1651,10 +1659,168 @@ fn image_format_label(lower: &str) -> &'static str {
     }
 }
 
+/// 传输语法 UID → 人类可读名称（用于文件信息对话框显示，未收录则返回 None）。
+/// 注意入参应是已 trim 掉 DICOM 偶数字节补齐（尾随空格/NUL）的 UID。
+fn ts_display_name(uid: &str) -> Option<&'static str> {
+    let s = match uid {
+        "1.2.840.10008.1.2" => "隐式 VR 小端（Implicit VR Little Endian）",
+        "1.2.840.10008.1.2.1" => "显式 VR 小端（Explicit VR Little Endian）",
+        "1.2.840.10008.1.2.1.99" => "Deflated 显式 VR 小端",
+        "1.2.840.10008.1.2.2" => "显式 VR 大端（已弃用）",
+        "1.2.840.10008.1.2.4.50" => "JPEG 基线（有损，8-bit）",
+        "1.2.840.10008.1.2.4.51" => "JPEG 扩展（有损，12-bit）",
+        "1.2.840.10008.1.2.4.57" => "JPEG 无损非分层（Lossless SV1）",
+        "1.2.840.10008.1.2.4.70" => "JPEG 无损一阶预测（已弃用）",
+        "1.2.840.10008.1.2.4.80" => "JPEG-LS 无损",
+        "1.2.840.10008.1.2.4.81" => "JPEG-LS 近无损（有损）",
+        "1.2.840.10008.1.2.4.90" => "JPEG 2000 无损（无损-only）",
+        "1.2.840.10008.1.2.4.91" => "JPEG 2000（可有损）",
+        "1.2.840.10008.1.2.4.92" => "JPEG 2000 Part2 多分量无损",
+        "1.2.840.10008.1.2.4.93" => "JPEG 2000 Part2 多分量（可有损）",
+        "1.2.840.10008.1.2.4.200" => "HTJ2K 无损（本应用私有 UID）",
+        "1.2.840.10008.1.2.4.201" => "HTJ2K 无损（High-Throughput JPEG 2000）",
+        "1.2.840.10008.1.2.4.202" => "HTJ2K 有损（本应用私有 UID）",
+        "1.2.840.10008.1.2.4.203" => "HTJ2K（HTJ2K RPCL）",
+        "1.2.840.10008.1.2.5" => "RLE 无损（Run Length Encoding）",
+        "1.2.840.10008.1.2.6.1" => "RFC 2557 MIME 封装",
+        "1.2.840.10008.1.2.4.100" => "MPEG2 Main Profile / Main Level",
+        "1.2.840.10008.1.2.4.102" => "MPEG-4 AVC/H.264 High Profile",
+        _ => return None,
+    };
+    Some(s)
+}
+
+/// 元素值用于展示前的规整：DICOM 要求字符串按偶数字节补齐（末尾补空格或 NUL），
+/// 直接显示会出现不可见尾随空白，复制出去比对/粘贴易出错，故统一 trim 尾随填充。
+/// 适用于 UI / SH / AE 等所有字符串类 VR，不限于 UID。
+fn trim_dicom_padding(s: &str) -> &str {
+    s.trim_end_matches([' ', '\0'])
+}
+
 // DICOM：遍历全部数据元素，返回 (tag, vr, keyword, value)
 fn dicom_tags(path: &str) -> Result<FileTags, String> {
     let obj = dicom_object::open_file(path).map_err(|e| format!("打开 DICOM 失败: {}", e))?;
     let mut rows: Vec<TagRow> = Vec::new();
+
+    // —— 文件元信息（0002 组）——
+    // obj.iter() 只遍历数据集，不含文件头；而传输语法、媒体存储 SOP 类/实例 UID、
+    // 实现版本等都在 0002 组，必须单独从 obj.meta() 取，否则界面看不到传输语法等信息。
+    let meta = obj.meta();
+    let push_meta =
+        |rows: &mut Vec<TagRow>, elem: u16, vr: &str, keyword: &str, value: String| {
+            let kw = keyword.to_string();
+            let description = match tag_explanation(&kw) {
+                Some(s) => s.to_string(),
+                None => format!("VR {}（{}）", vr, vr_meaning(vr)),
+            };
+            rows.push(TagRow {
+                tag: format!("(0002,{:04X})", elem),
+                vr: vr.to_string(),
+                keyword: kw,
+                value,
+                description,
+            });
+        };
+    push_meta(
+        &mut rows,
+        0x0000,
+        "UL",
+        "FileMetaInformationGroupLength",
+        meta.information_group_length.to_string(),
+    );
+    push_meta(
+        &mut rows,
+        0x0001,
+        "OB",
+        "FileMetaInformationVersion",
+        format!(
+            "0x{:02X}{:02X}",
+            meta.information_version[0], meta.information_version[1]
+        ),
+    );
+    push_meta(
+        &mut rows,
+        0x0002,
+        "UI",
+        "MediaStorageSOPClassUID",
+        trim_dicom_padding(&meta.media_storage_sop_class_uid).to_string(),
+    );
+    push_meta(
+        &mut rows,
+        0x0003,
+        "UI",
+        "MediaStorageSOPInstanceUID",
+        trim_dicom_padding(&meta.media_storage_sop_instance_uid).to_string(),
+    );
+    // 传输语法：除 UID 本体外，把人类可读名称并入悬停说明，免去对照 UID 表
+    let ts_uid = trim_dicom_padding(&meta.transfer_syntax).to_string();
+    push_meta(&mut rows, 0x0010, "UI", "TransferSyntaxUID", ts_uid.clone());
+    if let Some(name) = ts_display_name(&ts_uid) {
+        if let Some(r) = rows.last_mut() {
+            r.description = format!("{}\n当前值：{}", r.description, name);
+        }
+    }
+    push_meta(
+        &mut rows,
+        0x0012,
+        "UI",
+        "ImplementationClassUID",
+        trim_dicom_padding(&meta.implementation_class_uid).to_string(),
+    );
+    if let Some(v) = &meta.implementation_version_name {
+        push_meta(
+            &mut rows,
+            0x0013,
+            "SH",
+            "ImplementationVersionName",
+            trim_dicom_padding(v).to_string(),
+        );
+    }
+    if let Some(v) = &meta.source_application_entity_title {
+        push_meta(
+            &mut rows,
+            0x0016,
+            "AE",
+            "SourceApplicationEntityTitle",
+            trim_dicom_padding(v).to_string(),
+        );
+    }
+    if let Some(v) = &meta.sending_application_entity_title {
+        push_meta(
+            &mut rows,
+            0x0017,
+            "AE",
+            "SendingApplicationEntityTitle",
+            trim_dicom_padding(v).to_string(),
+        );
+    }
+    if let Some(v) = &meta.receiving_application_entity_title {
+        push_meta(
+            &mut rows,
+            0x0018,
+            "AE",
+            "ReceivingApplicationEntityTitle",
+            trim_dicom_padding(v).to_string(),
+        );
+    }
+    if let Some(v) = &meta.private_information_creator_uid {
+        push_meta(
+            &mut rows,
+            0x0100,
+            "UI",
+            "PrivateInformationCreatorUID",
+            trim_dicom_padding(v).to_string(),
+        );
+    }
+    if let Some(v) = &meta.private_information {
+        let shown = if v.len() <= 24 {
+            v.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+        } else {
+            format!("<{} 字节私有信息（已省略）>", v.len())
+        };
+        push_meta(&mut rows, 0x0102, "OB", "PrivateInformation", shown);
+    }
+
     for elem in obj.iter() {
         let tag = elem.tag();
         // 跳过像素数据元素，避免载荷爆炸
@@ -2497,6 +2663,46 @@ mod tests {
         assert!(
             !tags.rows.iter().any(|r| r.value.contains("像素数据已省略") && r.tag != "(7FE0,0010)"),
             "非像素数据元素不应被省略"
+        );
+        // —— 文件元信息（0002 组）必须可见，否则界面看不到传输语法等信息 ——
+        let ts = tags
+            .rows
+            .iter()
+            .find(|r| r.tag == "(0002,0010)")
+            .unwrap_or_else(|| panic!("应含文件元信息 TransferSyntaxUID (0002,0010)"));
+        assert_eq!(ts.keyword, "TransferSyntaxUID");
+        assert!(
+            ts.value.starts_with("1.2.840.10008.1.2"),
+            "传输语法值异常: {}",
+            ts.value
+        );
+        assert!(
+            !ts.value.ends_with(' '),
+            "展示用的 UID 不应带 DICOM 偶数字节补齐的尾随空格: {:?}",
+            ts.value
+        );
+        assert!(
+            ts.description.contains("当前值："),
+            "传输语法悬停说明应附带人类可读名称，实际: {}",
+            ts.description
+        );
+        for expect in ["(0002,0002)", "(0002,0003)", "(0002,0012)"] {
+            assert!(
+                tags.rows.iter().any(|r| r.tag == expect),
+                "应含文件元信息标签 {}",
+                expect
+            );
+        }
+        // 元信息须排在数据集之前，与 DICOM 文件物理布局一致
+        let first_meta = tags.rows.iter().position(|r| r.tag.starts_with("(0002,")).unwrap();
+        let first_dataset = tags
+            .rows
+            .iter()
+            .position(|r| !r.tag.starts_with("(0002,"))
+            .unwrap();
+        assert!(
+            first_meta < first_dataset,
+            "文件元信息(0002 组)应排在数据集之前"
         );
     }
 
