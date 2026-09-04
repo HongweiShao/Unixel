@@ -971,9 +971,16 @@ fn load_dicom_meta(path: String) -> Result<DicomMeta, String> {
 }
 
 /// 返回像素原始字节（f32 LE，长度 = width*height*frames*4），走二进制响应避免 JSON number[] 膨胀。
-#[tauri::command]
-fn load_dicom_pixels(path: String) -> Result<tauri::ipc::Response, String> {
+// 同步实现：由 async 命令 load_dicom_pixels 经 spawn_blocking 调用，避免冻结 UI
+fn load_dicom_pixels_impl(path: String) -> Result<tauri::ipc::Response, String> {
     Ok(tauri::ipc::Response::new(decode_or_cache(&path)?.pixel_bytes.clone()))
+}
+
+#[tauri::command]
+async fn load_dicom_pixels(path: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || load_dicom_pixels_impl(path))
+        .await
+        .map_err(|e| format!("加载像素线程异常: {}", e))?
 }
 
 #[tauri::command]
@@ -981,15 +988,29 @@ fn load_image(path: String) -> Result<DicomImage, String> {
     decode_regular_image(&path)
 }
 
-#[tauri::command]
-fn load_nifti(path: String) -> Result<NiftiVolume, String> {
+// 同步实现：由 async 命令 load_nifti 经 spawn_blocking 调用，避免冻结 UI
+fn load_nifti_impl(path: String) -> Result<NiftiVolume, String> {
     decode_nifti(&path)
 }
 
 #[tauri::command]
-fn load_htj2k(path: String) -> Result<DicomImage, String> {
+async fn load_nifti(path: String) -> Result<NiftiVolume, String> {
+    tauri::async_runtime::spawn_blocking(move || load_nifti_impl(path))
+        .await
+        .map_err(|e| format!("加载 NIfTI 线程异常: {}", e))?
+}
+
+// 同步实现：由 async 命令 load_htj2k 经 spawn_blocking 调用，避免冻结 UI
+fn load_htj2k_impl(path: String) -> Result<DicomImage, String> {
     let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))?;
     decode_htj2k(&bytes)
+}
+
+#[tauri::command]
+async fn load_htj2k(path: String) -> Result<DicomImage, String> {
+    tauri::async_runtime::spawn_blocking(move || load_htj2k_impl(path))
+        .await
+        .map_err(|e| format!("加载 HTJ2K 线程异常: {}", e))?
 }
 
 // ---------- 导出 JPEG（带四角 DICOM 标签叠加 + 居中斜向半透明水印） ----------
@@ -1849,8 +1870,8 @@ fn elem_str(obj: &InMemDicomObject, name: &str) -> Option<String> {
 }
 
 // 递归扫描文件夹，按 StudyInstanceUID → SeriesInstanceUID 两级聚合；非 DICOM 归入 others
-#[tauri::command]
-fn scan_folder_series(dir: String) -> Result<SeriesTree, String> {
+// 同步实现：由 async 命令 scan_folder_series 经 spawn_blocking 调用，避免冻结 UI
+fn scan_folder_series_impl(dir: String) -> Result<SeriesTree, String> {
     let root = Path::new(&dir);
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(root, &mut files);
@@ -1970,6 +1991,13 @@ fn scan_folder_series(dir: String) -> Result<SeriesTree, String> {
         studies,
         others: others_brief,
     })
+}
+
+#[tauri::command]
+async fn scan_folder_series(dir: String) -> Result<SeriesTree, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_folder_series_impl(dir))
+        .await
+        .map_err(|e| format!("扫描序列线程异常: {}", e))?
 }
 
 // 加载指定序列的文件路径列表：构建 ImageInfo 并按系列分组排序（仅所选序列进入视图）
@@ -4843,7 +4871,7 @@ fn run_batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<Ba
     }
     let mut units: Vec<Unit> = Vec::new();
     if args.input_type.eq_ignore_ascii_case("DICOM") {
-        let tree = scan_folder_series(args.input_dir.clone())?;
+        let tree = scan_folder_series_impl(args.input_dir.clone())?;
         for study in &tree.studies {
             for series in &study.series {
                 if series.paths.is_empty() {
