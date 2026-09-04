@@ -562,35 +562,217 @@ fn decode_dicom_jpegls(
     })
 }
 
+/// 将单个 HTJ2K 片段解码为「原始存储像素值」（数值 i32，保持编码端位深/符号性）。
+/// openjph 在可逆(无损) 5/3 小波下精确还原编码端 exchange 的 i32 数值（有符号按位等价），
+/// 无需再 reinterpret 字节，故可直接乘以 RescaleSlope + Intercept 还原 HU。
+fn htj2k_decode_samples(codestream: &[u8]) -> Result<(u32, u32, Vec<i32>), String> {
+    use openjph_core::codestream::Codestream;
+    use openjph_core::file::MemInfile;
+    let mut infile = MemInfile::new(codestream);
+    let mut cs = Codestream::new();
+    cs.read_headers(&mut infile)
+        .map_err(|e| format!("HTJ2K 读头失败: {}", e))?;
+    let siz = cs.access_siz();
+    let width = siz.get_width(0);
+    let height = siz.get_height(0);
+    cs.create(&mut infile)
+        .map_err(|e| format!("HTJ2K 创建失败: {}", e))?;
+    let mut samples: Vec<i32> = Vec::with_capacity((width * height) as usize);
+    for _ in 0..height {
+        let line = cs
+            .pull(0)
+            .ok_or_else(|| "HTJ2K 解码行失败（codestream 不完整）".to_string())?;
+        for v in line {
+            samples.push(v);
+        }
+    }
+    Ok((width, height, samples))
+}
+
 /// HTJ2K 解码回退（dicom-pixeldata 0.7 未内置 HTJ2K 解码器）。
-/// 复用项目自带 openjph-core 解码器：取首个 PixelData 片段（单帧 DICOM 常见；
-/// 合并多帧仅解码首帧，与 load_htj2k 行为一致）→ decode_htj2k。
+/// 复用项目自带 openjph-core 解码器：逐帧取封装 PixelData 片段 → 解码还原「存储像素值」
+/// → 套用 Modality LUT（RescaleSlope/Intercept）得 HU(f32)，与标准解码路径(未压缩)及
+/// JPEG-LS 回退保持一致，确保 HTJ2K 导出文件打开后 HU 与原文件一致（修复「数据不一致」）。
 /// 覆盖本应用非标准 UID(.200/.201) 与官方 UID(.203)。
 fn decode_dicom_htj2k(
     obj: &FileDicomObject<InMemDicomObject>,
     path: &str,
 ) -> Result<DicomImage, String> {
+    let attr_u32 = |name: &str, default: u32| -> u32 {
+        obj.element_by_name(name)
+            .ok()
+            .and_then(|e| e.to_str().ok())
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    };
+    let attr_f64 = |name: &str, default: f64| -> f64 {
+        obj.element_by_name(name)
+            .ok()
+            .and_then(|e| e.to_str().ok())
+            .and_then(|s| {
+                s.split('\\')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+            })
+            .unwrap_or(default)
+    };
+
+    let width = attr_u32("Columns", 0);
+    let height = attr_u32("Rows", 0);
+    let frames = attr_u32("NumberOfFrames", 1);
+    let samples = attr_u32("SamplesPerPixel", 1);
+    let bits_allocated = attr_u32("BitsAllocated", 16);
+    let bits_stored = attr_u32("BitsStored", bits_allocated);
+    let pixel_representation = attr_u32("PixelRepresentation", 0);
+
+    if width == 0 || height == 0 {
+        return Err("HTJ2K 解码失败：缺少 Rows/Columns".into());
+    }
+    if samples != 1 {
+        return Err(format!(
+            "暂仅支持单通道（灰度）影像，当前每像素样本数 = {}",
+            samples
+        ));
+    }
+
+    let slope = attr_f64("RescaleSlope", 1.0);
+    let intercept = attr_f64("RescaleIntercept", 0.0);
+
+    // 提取封装 PixelData 片段（每帧一个 fragment）；单帧多片段则合并整体解码
     let pd_elem = obj
         .element_by_name("PixelData")
         .map_err(|e| format!("读取 PixelData 失败: {}", e))?;
-    let frag: Vec<u8> = match pd_elem.value() {
-        Value::PixelSequence(seq) => {
-            let frags = seq.fragments();
-            if frags.is_empty() {
-                return Err("HTJ2K 解码失败：PixelData 无片段".into());
-            }
-            frags[0].clone()
-        }
+    let frags: Vec<Vec<u8>> = match pd_elem.value() {
+        Value::PixelSequence(seq) => seq.fragments().to_vec(),
         _ => return Err("HTJ2K 解码失败：PixelData 非封装格式".into()),
     };
-    let mut img = decode_htj2k(&frag)?;
-    img.meta.path = path.to_string();
-    img.meta.filename = Path::new(path)
+
+    let frame_count = frames as usize;
+    let per_frame: Vec<Vec<u8>> = if frags.len() == frame_count {
+        frags
+    } else if frame_count == 1 {
+        vec![frags.concat()]
+    } else {
+        return Err(format!(
+            "HTJ2K 片段数({}) 与帧数({}) 不匹配且非单帧，无法划分帧边界",
+            frags.len(),
+            frame_count
+        ));
+    };
+
+    let npx = (width * height) as usize;
+    let mut hu: Vec<f32> = Vec::with_capacity(frame_count * npx);
+    for frag in &per_frame {
+        let (_w, _h, stored) = htj2k_decode_samples(frag)?;
+        if stored.len() != npx {
+            return Err(format!(
+                "HTJ2K 解码像素数({}) 与期望({}) 不符",
+                stored.len(),
+                npx
+            ));
+        }
+        // openjph 已按组件符号性返回数值化存储值（有符号为补码等价），直接套 Rescale 得 HU
+        for s in stored {
+            hu.push((s as f64 * slope + intercept) as f32);
+        }
+    }
+
+    // 多帧 Enhanced：按逐帧平面位置重排（与传统多帧保持原序），与标准解码路径一致
+    if frame_count > 1 {
+        if let (Some(oop), Some(per_pos)) = (
+            obj.element_by_name("ImageOrientationPatient")
+                .ok()
+                .and_then(|e| e.to_str().ok())
+                .and_then(|s| parse_ds_vec(&s)),
+            per_frame_positions(obj),
+        ) {
+            if oop.len() == 6 && per_pos.len() == frame_count {
+                let normal = normalize3(&cross3(
+                    &[oop[0], oop[1], oop[2]],
+                    &[oop[3], oop[4], oop[5]],
+                ));
+                let flip = if normal[2] >= 0.0 { 1.0 } else { -1.0 };
+                let mut idxs: Vec<usize> = (0..frame_count).collect();
+                idxs.sort_by(|&a, &b| {
+                    let ka = (per_pos[a][0] * normal[0]
+                        + per_pos[a][1] * normal[1]
+                        + per_pos[a][2] * normal[2])
+                        * flip;
+                    let kb = (per_pos[b][0] * normal[0]
+                        + per_pos[b][1] * normal[1]
+                        + per_pos[b][2] * normal[2])
+                        * flip;
+                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut reordered = vec![0.0f32; hu.len()];
+                for (new_i, &old_i) in idxs.iter().enumerate() {
+                    reordered[new_i * npx..(new_i + 1) * npx]
+                        .copy_from_slice(&hu[old_i * npx..(old_i + 1) * npx]);
+                }
+                hu = reordered;
+            }
+        }
+    }
+
+    let filename = Path::new(path)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown.dcm")
         .to_string();
-    Ok(img)
+
+    let window_center_in = attr_f64("WindowCenter", 40.0);
+    let window_width_in = attr_f64("WindowWidth", 400.0);
+    let (window_center, window_width) = window_to_hu(window_center_in, window_width_in, slope, intercept);
+
+    let photometric = obj
+        .element_by_name("PhotometricInterpretation")
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("MONOCHROME2"))
+        .to_string();
+
+    let mut hu_min = f32::INFINITY;
+    let mut hu_max = f32::NEG_INFINITY;
+    for &v in &hu {
+        if v < hu_min {
+            hu_min = v;
+        }
+        if v > hu_max {
+            hu_max = v;
+        }
+    }
+    if !hu_min.is_finite() || !hu_max.is_finite() {
+        hu_min = -1024.0;
+        hu_max = 3071.0;
+    }
+
+    let mut pixel_bytes = Vec::with_capacity(hu.len() * 4);
+    for v in &hu {
+        pixel_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+
+    Ok(DicomImage {
+        meta: DicomMeta {
+            path: path.to_string(),
+            filename,
+            width,
+            height,
+            frames,
+            bits_stored: bits_stored as u16,
+            pixel_representation: pixel_representation as u16,
+            slope,
+            intercept,
+            window_center,
+            window_width,
+            photometric,
+            hu_min,
+            hu_max,
+        },
+        pixel_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -6019,6 +6201,94 @@ mod export_dicom_tests {
         assert_eq!(open_errors, 0, "存在无法打开（传输语法错误）的导出文件");
         assert_eq!(ts_mismatch, 0, "存在传输语法声明不符的导出文件");
         assert_eq!(decode_errors, 0, "存在解码或结构错误的导出文件");
+    }
+
+    #[test]
+    fn htj2k_export_preserves_hu_vs_original() {
+        let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
+        // 复现「HTJ2K 导出后数据与原数据不一致」：导出前/后分别经 decode_dicom_file 取 HU，
+        // 断言无损 HTJ2K 往返后 HU 逐像素一致。修复前解码端把样本截断为 8bit 且未套
+        // RescaleSlope/Intercept，导致 HU 整体偏移且高位丢失（CBCT 表现为数值严重失真）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("无法读取 data/CBCT")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "data/CBCT 下未找到 .dcm 文件");
+        let src = files[0].clone();
+
+        let orig = decode_dicom_file(&src).expect("解码原文件失败");
+        let to_hu = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        let orig_hu = to_hu(&orig.pixel_bytes);
+        assert!(!orig_hu.is_empty(), "原文件像素不应为空");
+
+        let out_dir = std::env::temp_dir().join("unixel_htj2k_hu");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // 不脱敏的纯压缩往返（隔离「压缩一致性」变量）
+        let mut ok = false;
+        for _ in 0..8 {
+            let args = ExportDicomArgs {
+                mode: "all".into(),
+                file_path: src.clone(),
+                series_paths: vec![src.clone()],
+                frame_index: 0,
+                transfer_syntax: "htj2k_lossless".into(),
+                quality: 0,
+                wc: 0.0,
+                ww: 0.0,
+                anon_ranges: vec![],
+                password: String::new(),
+                restore_password: String::new(),
+                force_layered: false,
+                output: out_dir.to_string_lossy().to_string(),
+                multifile: true,
+            };
+            match export_dicom_impl(args) {
+                Ok(_) => {
+                    ok = true;
+                    break;
+                }
+                Err(e) if e.contains("已取消") => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("HTJ2K 导出失败: {}", e),
+            }
+        }
+        assert!(ok, "HTJ2K 无损导出应成功");
+
+        let exp_path = out_dir.join("frame_001.dcm");
+        assert!(exp_path.exists(), "应生成 frame_001.dcm");
+        let exp = decode_dicom_file(&exp_path.to_string_lossy())
+            .expect("解码导出文件失败");
+        let exp_hu = to_hu(&exp.pixel_bytes);
+
+        assert_eq!(exp_hu.len(), orig_hu.len(), "像素数应与原文件一致");
+        let mut max_diff = 0.0f32;
+        for i in 0..orig_hu.len() {
+            let d = (orig_hu[i] - exp_hu[i]).abs();
+            if d > max_diff {
+                max_diff = d;
+            }
+        }
+        println!(
+            "[htj2k-hu] 原文件 HU min/max={}/{}, 导出 HU min/max={}/{}, 最大逐像素差={}",
+            orig.meta.hu_min, orig.meta.hu_max, exp.meta.hu_min, exp.meta.hu_max, max_diff
+        );
+        assert!(
+            max_diff < 1.0,
+            "HTJ2K 无损应逐像素保持一致（修复前因 8bit 截断+未套 Rescale 会偏差数千），实际最大差 {}",
+            max_diff
+        );
     }
 
     #[test]

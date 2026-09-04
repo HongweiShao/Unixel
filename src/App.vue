@@ -86,13 +86,48 @@ const tsOptions = [
   { value: "htj2k_lossy", label: "HTJ2K 有损" },
 ] as const;
 const anonGroups = [
-  { id: "patient", label: "患者身份" },
-  { id: "personnel", label: "人员身份" },
-  { id: "institution", label: "机构信息" },
-  { id: "device", label: "设备信息" },
-  { id: "datetime", label: "日期时间" },
-  { id: "uid", label: "唯一标识" },
-  { id: "freetext", label: "自由文本" },
+  {
+    id: "patient",
+    label: "患者身份",
+    tip:
+      "PatientName (0010,0010)\nPatientID (0010,0020)\nPatientBirthDate (0010,0030)\nPatientAddress (0010,1040)\nPatientTelephoneNumbers (0010,2154)\nOtherPatientIDs (0010,1000)",
+  },
+  {
+    id: "personnel",
+    label: "人员身份",
+    tip:
+      "ReferringPhysicianName (0008,0090)\nPerformingPhysicianName (0008,1050)\nOperatorsName (0008,1070)\nNameOfPhysiciansReadingStudy (0008,1060)\nConsultingPhysicianName (0008,009C)",
+  },
+  {
+    id: "institution",
+    label: "机构信息",
+    tip:
+      "InstitutionName (0008,0080)\nInstitutionAddress (0008,0081)\nInstitutionalDepartmentName (0008,1040)\nStationName (0008,1010)",
+  },
+  {
+    id: "device",
+    label: "设备信息",
+    tip:
+      "Manufacturer (0008,0070)\nManufacturerModelName (0008,1090)\nDeviceSerialNumber (0018,1000)",
+  },
+  {
+    id: "datetime",
+    label: "日期时间",
+    tip:
+      "StudyDate (0008,0020)\nStudyTime (0008,0030)\nAcquisitionDate (0008,0022)\nAcquisitionTime (0008,0032)\nSeriesDate (0008,0021)\nSeriesTime (0008,0031)",
+  },
+  {
+    id: "uid",
+    label: "唯一标识",
+    tip:
+      "StudyInstanceUID (0020,000D)\nSeriesInstanceUID (0020,000E)\nSOPInstanceUID (0008,0018)\nFrameOfReferenceUID (0020,0052)\nAcquisitionUID (0008,0017)\nAccessionNumber (0008,0050)",
+  },
+  {
+    id: "freetext",
+    label: "自由文本",
+    tip:
+      "StudyDescription (0008,1030)\nSeriesDescription (0008,103E)\nImageComments (0020,4000)\nAdditionalPatientHistory (0010,21B0)\nIdentifyingComments (0008,4000)\nAcquisitionProtocolDescription (0018,9424)",
+  },
 ] as const;
 const anonMethodOptions = (gid: string) => {
   const base = [
@@ -121,6 +156,24 @@ const batchAnonMap = reactive<Record<string, string>>(
 const batchAnonPassword = ref<string>("unixel");
 // 方案A「还原重脱敏」：批量导出 DICOM 时，填入原脱敏密码可还原本工具加密脱敏值后再重脱敏。
 const batchAnonRestorePassword = ref<string>("");
+// 脱敏范围说明气泡：Teleport 到 body 渲染，避免被 .batch-body 滚动容器裁剪
+const anonTip = reactive<{ show: boolean; x: number; y: number; text: string }>({
+  show: false,
+  x: 0,
+  y: 0,
+  text: "",
+});
+function showAnonTip(e: MouseEvent | FocusEvent, text: string) {
+  const el = e.currentTarget as HTMLElement;
+  const r = el.getBoundingClientRect();
+  anonTip.x = r.left + r.width / 2;
+  anonTip.y = r.bottom + 6;
+  anonTip.text = text;
+  anonTip.show = true;
+}
+function hideAnonTip() {
+  anonTip.show = false;
+}
 const batchNiiType = ref<string>("int16");
 const batchNiiSform = ref(true);
 const batchNiiGz = ref(true);
@@ -1172,6 +1225,17 @@ onMounted(async () => {
                 <div class="batch-anon-grid">
                   <div class="batch-anon-item" v-for="g in anonGroups" :key="g.id">
                     <span class="batch-anon-name">{{ g.label }}</span>
+                    <span
+                      class="anon-help"
+                      tabindex="0"
+                      role="img"
+                      :aria-label="g.label + ' 脱敏范围说明'"
+                      @mouseenter="showAnonTip($event, g.tip)"
+                      @mouseleave="hideAnonTip"
+                      @focus="showAnonTip($event, g.tip)"
+                      @blur="hideAnonTip"
+                      >?</span
+                    >
                     <select v-model="batchAnonMap[g.id]" :disabled="batchRunning" class="batch-select">
                       <option v-for="m in anonMethodOptions(g.id)" :key="m.value" :value="m.value">{{ m.label }}</option>
                     </select>
@@ -1185,7 +1249,6 @@ onMounted(async () => {
                   <span class="batch-label">解密密码</span>
                   <input type="password" v-model="batchAnonRestorePassword" :disabled="batchRunning" class="batch-input" placeholder="还原已加密脱敏用，留空则直接处理" />
                 </div>
-                <p class="batch-hint">注：自动写入 SoftwareVersions（Unixel），无需手动设置。</p>
               </div>
             </template>
             <template v-else>
@@ -1239,6 +1302,14 @@ onMounted(async () => {
         </div>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="anonTip.show"
+        class="anon-tip-pop"
+        :style="{ left: anonTip.x + 'px', top: anonTip.y + 'px' }"
+      >{{ anonTip.text }}</div>
+    </Teleport>
 
     <!-- 详情对话框 -->
     <div v-if="detailsOpen" class="modal-mask" @click.self="detailsOpen = false">
@@ -2184,6 +2255,46 @@ main {
   font-size: 12px;
   color: var(--fg-dim);
   line-height: 1.5;
+}
+/* 脱敏范围说明：字段后的圆形问号 */
+.anon-help {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  user-select: none;
+}
+.anon-help:hover,
+.anon-help:focus {
+  filter: brightness(1.12);
+  outline: none;
+}
+/* 悬停弹出的标签明细（Teleport 到 body，固定定位，不被滚动容器裁剪） */
+.anon-tip-pop {
+  position: fixed;
+  transform: translateX(-50%);
+  max-width: 300px;
+  padding: 8px 10px;
+  background: var(--tooltip-bg, #1f2430);
+  color: var(--tooltip-fg, #f4f6fb);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-line;
+  text-align: left;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  z-index: 9999;
+  pointer-events: none;
 }
 .batch-warn {
   color: #e0a000;
