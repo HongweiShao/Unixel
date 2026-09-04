@@ -1153,8 +1153,8 @@ fn draw_watermark(img: &mut RgbaImage, text: &str, font: &FontRef) {
 }
 
 // 导出 JPEG：支持「当前帧 / 所有（多帧全帧或同系列全切片）」，可叠加四角 DICOM 标签与水印
-#[tauri::command]
-fn export_jpeg(
+// 同步实现：由 async 命令 export_jpeg 经 spawn_blocking 调用，避免冻结 UI（与 batch_convert 同一模式）
+fn export_jpeg_impl(
     mode: String,        // "current" | "all"
     file_path: String,   // 当前源文件（current 取指定帧；all 多帧取全部帧）
     series_paths: Vec<String>, // all 多文件系列：有序切片路径；其余为空
@@ -1241,6 +1241,40 @@ fn export_jpeg(
     }
 
     Ok(format!("已导出 {} 张 JPEG", n))
+}
+
+#[tauri::command]
+async fn export_jpeg(
+    mode: String,
+    file_path: String,
+    series_paths: Vec<String>,
+    frame_index: u32,
+    wc: f64,
+    ww: f64,
+    photometric: String,
+    overlays: Vec<OverlayTag>,
+    watermark: String,
+    quality: u8,
+    output: String,
+) -> Result<String, String> {
+    // 非阻塞：重活放到后台线程，避免冻结 UI（与 batch_convert 同一模式）
+    tauri::async_runtime::spawn_blocking(move || {
+        export_jpeg_impl(
+            mode,
+            file_path,
+            series_paths,
+            frame_index,
+            wc,
+            ww,
+            photometric,
+            overlays,
+            watermark,
+            quality,
+            output,
+        )
+    })
+    .await
+    .map_err(|e| format!("导出任务线程异常: {}", e))?
 }
 
 // ---------- 文件标签（详情对话框） ----------
