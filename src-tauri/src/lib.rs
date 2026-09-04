@@ -2001,8 +2001,8 @@ async fn scan_folder_series(dir: String) -> Result<SeriesTree, String> {
 }
 
 // 加载指定序列的文件路径列表：构建 ImageInfo 并按系列分组排序（仅所选序列进入视图）
-#[tauri::command]
-fn load_series_files(paths: Vec<String>) -> Result<Vec<ImageInfo>, String> {
+// 同步实现：由 async 命令 load_series_files 经 spawn_blocking 调用，避免冻结 UI
+fn load_series_files_impl(paths: Vec<String>) -> Result<Vec<ImageInfo>, String> {
     let mut infos: Vec<ImageInfo> = Vec::new();
     for p in &paths {
         if let Some(kind) = classify_image_kind(p) {
@@ -2023,6 +2023,13 @@ fn load_series_files(paths: Vec<String>) -> Result<Vec<ImageInfo>, String> {
         }
     }
     Ok(sorted)
+}
+
+#[tauri::command]
+async fn load_series_files(paths: Vec<String>) -> Result<Vec<ImageInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || load_series_files_impl(paths))
+        .await
+        .map_err(|e| format!("加载序列文件线程异常: {}", e))?
 }
 
 // 读取 DICOM 的系列与位置字段（不解码像素），用于按系列分组、位置排序、系列内切换
