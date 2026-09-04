@@ -33,6 +33,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Emitter;
+// HTJ2K 传输语法未包含在 dicom-rs 内置注册表，需在运行时注册，否则 open_file 解析数据集会因
+// 无法识别传输语法而报「传输语法错误」（见 decode_dicom_file 中对 HTJ2K 的自研解码拦截）。
+use dicom_encoding::submit_ele_transfer_syntax;
+use dicom_encoding::Codec;
+
+// 注册 HTJ2K 传输语法为「显式 VR 小端 + 封装像素数据」：dicom-rs 仅用其解析数据集各元素，
+// 像素保持封装（不解码），随后由 decode_dicom_file 的自研 decode_dicom_htj2k 解码。
+// .201/.202 为 DICOM 官方标准 UID（导出侧使用）；.200/.203 为历史/兼容 UID，一并注册以便回读旧文件。
+submit_ele_transfer_syntax!("1.2.840.10008.1.2.4.201", "HTJ2K Lossless", Codec::EncapsulatedPixelData(None, None));
+submit_ele_transfer_syntax!("1.2.840.10008.1.2.4.202", "HTJ2K Lossy", Codec::EncapsulatedPixelData(None, None));
+submit_ele_transfer_syntax!("1.2.840.10008.1.2.4.200", "HTJ2K Lossless (legacy)", Codec::EncapsulatedPixelData(None, None));
+submit_ele_transfer_syntax!("1.2.840.10008.1.2.4.203", "HTJ2K (legacy 203)", Codec::EncapsulatedPixelData(None, None));
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -187,8 +199,8 @@ pub(crate) fn decode_dicom_file(path: &str) -> Result<DicomImage, String> {
     let obj = dicom_object::open_file(path).map_err(|e| format!("打开文件失败: {}", e))?;
 
     // 压缩传输语法回退：dicom-pixeldata 0.7 仅内置 JPEG(50/51)/RLE(5) 解码器，
-    // 对 JPEG-LS(80/81) 与 HTJ2K(200/201/203) 无原生解码器，需走项目自带纯 Rust 解码，
-    // 否则会出现 "Unsupported TransferSyntax" 错误（本应用自身导出的这两类 DICOM 亦无法回读）。
+    // 对 JPEG-LS(80/81) 与 HTJ2K(201/202/203，含已弃用的自定义 200) 无 dicom-pixeldata
+    // 原生解码器，需走项目自带纯 Rust 解码，否则会出现 "Unsupported TransferSyntax" 错误。
     let ts = obj.meta().transfer_syntax.clone();
     if ts == TS_JPEGLS_LOSSLESS || ts == TS_JPEGLS_LOSS {
         return decode_dicom_jpegls(&obj, path);
@@ -2470,11 +2482,12 @@ mod tests {
 const TS_IMPLICIT: &str = "1.2.840.10008.1.2";
 const TS_EXPLICIT: &str = "1.2.840.10008.1.2.1";
 const TS_RLE: &str = "1.2.840.10008.1.2.5";
-// 注：以下 UID 为用户指定值（HTJ2K 无损=200 / 有损=201）。官方 DICOM 注册表为
-// HTJ2K 无损=1.2.840.10008.1.2.4.201、有损=1.2.840.10008.1.2.4.202；如要求严格对齐
-// 官方注册表，请将下面两行改为 201 / 202。
-const TS_HTJ2K_LOSSLESS: &str = "1.2.840.10008.1.2.4.200";
-const TS_HTJ2K_LOSSY: &str = "1.2.840.10008.1.2.4.201";
+// HTJ2K 传输语法采用 DICOM 官方注册表标准 UID（dicom-rs 0.7.1 已识别，可正确解析数据集；
+// 仅编码器未注册，本项目用 openjph-core 自研编码与解码，故无需自定义 UID）。
+// 注：早期版本曾误用自定义 UID 1.2.840.10008.1.2.4.200/.201，因不在标准注册表中，
+// dicom_object::open_file 解析数据集时无法识别字节编码而报「传输语法错误」，外部查看器亦无法识别，已弃用。
+const TS_HTJ2K_LOSSLESS: &str = "1.2.840.10008.1.2.4.201";
+const TS_HTJ2K_LOSSY: &str = "1.2.840.10008.1.2.4.202";
 // JPEG-LS：无损 TS 1.2.840.10008.1.2.4.80（NEAR=0）；近无损 TS 1.2.840.10008.1.2.4.81（NEAR>0）。
 // 由 pure_jpegls 输出 ITU-T T.87 标准流，保留原始位深（8/16-bit）与符号性，不套窗宽窗位。
 const TS_JPEGLS_LOSSLESS: &str = "1.2.840.10008.1.2.4.80";
@@ -5527,6 +5540,25 @@ mod export_dicom_tests {
         assert_eq!(dw, w);
         assert_eq!(dh, h);
         assert_eq!(gray, frame);
+    }
+
+    #[test]
+    fn htj2k_transfer_syntax_registered() {
+        // 根因验证：dicom-rs 0.7 内置注册表不含任何 HTJ2K UID，若不通过 submit_ele_transfer_syntax!
+        // 注册，open_file 解析数据集会因未知 TS 报「传输语法错误」。本测试确认运行时注册已生效。
+        use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+        assert!(
+            TransferSyntaxRegistry.get("1.2.840.10008.1.2.4.201").is_some(),
+            "官方 HTJ2K 无损 UID 必须已注册（否则本应用无法回读自己导出的文件）"
+        );
+        assert!(
+            TransferSyntaxRegistry.get("1.2.840.10008.1.2.4.202").is_some(),
+            "官方 HTJ2K 有损 UID 必须已注册"
+        );
+        assert!(
+            TransferSyntaxRegistry.get("1.2.840.10008.1.2.4.200").is_some(),
+            "旧自定义 .200 也应已注册，以便回读旧版导出的文件"
+        );
     }
 
     #[test]

@@ -67,6 +67,11 @@ const batchRunning = ref(false);
 const batchCancelling = ref(false);
 const batchDone = ref(false);
 const batchLog = ref<BatchProgress[]>([]);
+const batchProgress = ref<{ k: number; n: number; label: string } | null>(null);
+const progressPercent = computed(() => {
+  const p = batchProgress.value;
+  return p && p.n > 0 ? Math.round((p.k / p.n) * 100) : 0;
+});
 const batchSummary = ref<string | null>(null);
 const batchError = ref<string | null>(null);
 
@@ -200,6 +205,7 @@ async function startBatch() {
   batchCancelling.value = false;
   batchDone.value = false;
   batchLog.value = [];
+  batchProgress.value = null;
   batchSummary.value = null;
   batchError.value = null;
   try {
@@ -368,6 +374,7 @@ async function openFile() {
         : (e as { message?: string })?.message ?? String(e);
   } finally {
     loading.value = false;
+    closeMenu();
   }
 }
 
@@ -403,6 +410,7 @@ async function importFolder() {
         : (e as { message?: string })?.message ?? String(e);
   } finally {
     listLoading.value = false;
+    closeMenu();
   }
 }
 
@@ -908,6 +916,7 @@ onMounted(async () => {
   try {
     await listen<BatchProgress>("batch-progress", (e) => {
       batchLog.value.push(e.payload);
+      batchProgress.value = { k: e.payload.k, n: e.payload.n, label: e.payload.label };
       if (batchLog.value.length > 400) {
         batchLog.value.splice(0, batchLog.value.length - 400);
       }
@@ -1194,6 +1203,17 @@ onMounted(async () => {
           <!-- 进度 -->
           <section class="batch-zone">
             <h3>进度</h3>
+            <div class="batch-progress">
+              <div class="batch-progress-track">
+                <div class="batch-progress-fill" :style="{ width: progressPercent + '%' }"></div>
+              </div>
+              <span class="batch-progress-label" v-if="batchProgress">
+                已处理 {{ batchProgress.k }} / {{ batchProgress.n }}（{{ progressPercent }}%）
+                <span class="batch-progress-cur">· {{ batchProgress.label }}</span>
+              </span>
+              <span class="batch-progress-label" v-else-if="batchRunning">准备中…</span>
+              <span class="batch-progress-label" v-else>尚未开始</span>
+            </div>
             <div class="batch-log">
               <p v-if="!batchRunning && !batchDone && !batchError" class="batch-hint">配置完成后点击「开始转换」。</p>
               <p v-for="(p, i) in batchLog" :key="i" :class="['batch-log-line', p.ok ? 'ok' : 'fail']">
@@ -2127,6 +2147,32 @@ main {
   flex: 0 0 64px;
   font-size: 13px;
   color: var(--fg-dim);
+}
+.batch-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.batch-progress-track {
+  height: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.batch-progress-fill {
+  height: 100%;
+  background: #3b82f6;
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+.batch-progress-label {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.batch-progress-cur {
+  color: var(--fg);
 }
 .batch-hint {
   margin: 0;
