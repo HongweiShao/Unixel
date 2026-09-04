@@ -2265,6 +2265,55 @@ mod tests {
     }
 
     #[test]
+    fn batch_progress_and_cancel_hooks() {
+        use std::sync::Mutex;
+        // 1) 进度回调：逐帧 report_frame_progress 应驱动回调，且清空后不再触发
+        let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        set_batch_progress_cb(Some(Arc::new(move |cur: usize, tot: usize| {
+            s.lock().unwrap().push((cur, tot));
+        })));
+        report_frame_progress(1, 390);
+        report_frame_progress(195, 390);
+        report_frame_progress(390, 390);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(1, 390), (195, 390), (390, 390)],
+            "逐帧进度回调应按 (cur,total) 顺序触发"
+        );
+        set_batch_progress_cb(None);
+        report_frame_progress(391, 390);
+        assert_eq!(seen.lock().unwrap().len(), 3, "清空回调后不应再触发");
+
+        // 2) 取消标志：置位后 batch_cancel_requested() 应为 true，复位后为 false
+        assert!(!batch_cancel_requested(), "初始不应为已取消");
+        batch_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(batch_cancel_requested(), "置位后应为已取消");
+        batch_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!batch_cancel_requested(), "复位后不应为已取消");
+
+        // 3) 生命周期守卫：Drop 时清除进度回调并复位取消标志
+        let s2: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2c = s2.clone();
+        set_batch_progress_cb(Some(Arc::new(move |c: usize, t: usize| {
+            s2c.lock().unwrap().push((c, t));
+        })));
+        batch_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let _g = BatchProgressGuard;
+        }
+        assert!(
+            !batch_cancel_requested(),
+            "守卫 Drop 后应复位取消标志"
+        );
+        report_frame_progress(1, 10);
+        assert!(
+            s2.lock().unwrap().is_empty(),
+            "守卫 Drop 后应清除进度回调"
+        );
+    }
+
+    #[test]
     fn htj2k_roundtrip_lossless() {
         let w = 48u32;
         let h = 32u32;
