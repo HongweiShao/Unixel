@@ -156,19 +156,32 @@ const batchAnonMap = reactive<Record<string, string>>(
 const batchAnonPassword = ref<string>("unixel");
 // 方案A「还原重脱敏」：批量导出 DICOM 时，填入原脱敏密码可还原本工具加密脱敏值后再重脱敏。
 const batchAnonRestorePassword = ref<string>("");
-// 脱敏范围说明气泡：Teleport 到 body 渲染，避免被 .batch-body 滚动容器裁剪
-const anonTip = reactive<{ show: boolean; x: number; y: number; text: string }>({
+// 脱敏范围说明气泡：Teleport 到 body 渲染，避免被 .batch-body 滚动容器裁剪。
+// 结构与文件信息对话框的 .qtip 保持一致（粗体标题 + .qtip-desc 逐行明细）。
+const anonTip = reactive<{
+  show: boolean;
+  x: number;
+  y: number;
+  title: string;
+  lines: string[];
+}>({
   show: false,
   x: 0,
   y: 0,
-  text: "",
+  title: "",
+  lines: [],
 });
-function showAnonTip(e: MouseEvent | FocusEvent, text: string) {
+function showAnonTip(e: MouseEvent | FocusEvent, title: string, text: string) {
   const el = e.currentTarget as HTMLElement;
   const r = el.getBoundingClientRect();
-  anonTip.x = r.left + r.width / 2;
+  // 弹窗为固定 260px 宽、水平居中于图标，故左右各留 134px 安全边距，避免贴边溢出视口
+  const half = 134;
+  const minX = half + 8;
+  const maxX = Math.max(minX, window.innerWidth - half - 8);
+  anonTip.x = Math.min(Math.max(r.left + r.width / 2, minX), maxX);
   anonTip.y = r.bottom + 6;
-  anonTip.text = text;
+  anonTip.title = title;
+  anonTip.lines = text.split("\n").filter((s) => s.trim().length > 0);
   anonTip.show = true;
 }
 function hideAnonTip() {
@@ -1226,13 +1239,13 @@ onMounted(async () => {
                   <div class="batch-anon-item" v-for="g in anonGroups" :key="g.id">
                     <span class="batch-anon-name">{{ g.label }}</span>
                     <span
-                      class="anon-help"
+                      class="qmark anon-help"
                       tabindex="0"
                       role="img"
                       :aria-label="g.label + ' 脱敏范围说明'"
-                      @mouseenter="showAnonTip($event, g.tip)"
+                      @mouseenter="showAnonTip($event, g.label, g.tip)"
                       @mouseleave="hideAnonTip"
-                      @focus="showAnonTip($event, g.tip)"
+                      @focus="showAnonTip($event, g.label, g.tip)"
                       @blur="hideAnonTip"
                       >?</span
                     >
@@ -1308,7 +1321,10 @@ onMounted(async () => {
         v-if="anonTip.show"
         class="anon-tip-pop"
         :style="{ left: anonTip.x + 'px', top: anonTip.y + 'px' }"
-      >{{ anonTip.text }}</div>
+      >
+        <b>{{ anonTip.title }}</b>
+        <span v-for="(line, i) in anonTip.lines" :key="i" class="qtip-desc">{{ line }}</span>
+      </div>
     </Teleport>
 
     <!-- 详情对话框 -->
@@ -1789,6 +1805,7 @@ main {
   cursor: help;
   position: relative;
   vertical-align: middle;
+  flex: 0 0 auto;
 }
 .qtip {
   display: none;
@@ -2256,43 +2273,30 @@ main {
   color: var(--fg-dim);
   line-height: 1.5;
 }
-/* 脱敏范围说明：字段后的圆形问号 */
+/* 脱敏范围说明：复用 .qmark 圆形问号，仅重置外边距（父级 .batch-anon-item 已用 gap 控制间距） */
 .anon-help {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 15px;
-  height: 15px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--accent, #3b82f6);
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
-  cursor: help;
-  user-select: none;
+  margin-left: 0;
 }
 .anon-help:hover,
 .anon-help:focus {
-  filter: brightness(1.12);
   outline: none;
 }
-/* 悬停弹出的标签明细（Teleport 到 body，固定定位，不被滚动容器裁剪） */
+/* 悬停弹出的标签明细：视觉与 .qtip 一致；Teleport 到 body 用固定定位，不被滚动容器裁剪 */
 .anon-tip-pop {
   position: fixed;
   transform: translateX(-50%);
+  width: 260px;
   max-width: 300px;
   padding: 8px 10px;
-  background: var(--tooltip-bg, #1f2430);
-  color: var(--tooltip-fg, #f4f6fb);
+  background: #1c1c22;
+  color: #f0f0f3;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.55;
-  white-space: pre-line;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: normal;
   text-align: left;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   z-index: 9999;
   pointer-events: none;
 }
