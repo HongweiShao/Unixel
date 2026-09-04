@@ -201,7 +201,11 @@ pub(crate) fn decode_dicom_file(path: &str) -> Result<DicomImage, String> {
     // 压缩传输语法回退：dicom-pixeldata 0.7 仅内置 JPEG(50/51)/RLE(5) 解码器，
     // 对 JPEG-LS(80/81) 与 HTJ2K(201/202/203，含已弃用的自定义 200) 无 dicom-pixeldata
     // 原生解码器，需走项目自带纯 Rust 解码，否则会出现 "Unsupported TransferSyntax" 错误。
-    let ts = obj.meta().transfer_syntax.clone();
+    // DICOM 要求 UID 补齐到偶数字节（末尾补空格或 NUL），故读回的传输语法可能带尾随空格/NUL。
+    // 注册表与下方常量均为未补齐形式，比较前必须 trim 尾随填充，否则 HTJ2K/JPEG-LS 路由匹配
+    // 失败，落到 decode_pixel_data 报「Unsupported TransferSyntax」（即用户所见「传输语法错误」）。
+    let ts = obj.meta().transfer_syntax.to_string();
+    let ts = ts.trim_end_matches([' ', '\0']);
     if ts == TS_JPEGLS_LOSSLESS || ts == TS_JPEGLS_LOSS {
         return decode_dicom_jpegls(&obj, path);
     }
@@ -2335,6 +2339,7 @@ mod tests {
 
     #[test]
     fn batch_progress_and_cancel_hooks() {
+        let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
         use std::sync::Mutex;
         // 1) 进度回调：逐帧 report_frame_progress 应驱动回调，且清空后不再触发
         let seen: Arc<Mutex<Vec<(usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2343,16 +2348,18 @@ mod tests {
             s.lock().unwrap().push((cur, tot));
         })));
         report_frame_progress(1, 390);
-        report_frame_progress(195, 390);
+        report_frame_progress(195, 390); // 非首/尾且 195%7≠0 → 被限流跳过
         report_frame_progress(390, 390);
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![(1, 390), (195, 390), (390, 390)],
-            "逐帧进度回调应按 (cur,total) 顺序触发"
+        let seen_v = seen.lock().unwrap().clone();
+        assert!(seen_v.contains(&(1, 390)), "首帧必须推送");
+        assert!(seen_v.contains(&(390, 390)), "收尾帧必须推送");
+        assert!(
+            !seen_v.contains(&(195, 390)),
+            "中间非步进帧应被限流（避免海量事件淹没前端）"
         );
         set_batch_progress_cb(None);
         report_frame_progress(391, 390);
-        assert_eq!(seen.lock().unwrap().len(), 3, "清空回调后不应再触发");
+        assert_eq!(seen.lock().unwrap().len(), seen_v.len(), "清空回调后不应再触发");
 
         // 2) 取消标志：置位后 batch_cancel_requested() 应为 true，复位后为 false
         assert!(!batch_cancel_requested(), "初始不应为已取消");
@@ -2387,6 +2394,7 @@ mod tests {
     /// 断言其提前中断（已处理帧数 < 总数）并返回「已取消」错误。这守护 v1.33 修复链中的「逐帧取消检查」。
     #[test]
     fn export_dicom_multifile_cancel_from_other_thread() {
+        let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
         let mut files: Vec<String> = std::fs::read_dir(&dir)
             .expect("无法读取 data/CBCT 目录")
@@ -2423,12 +2431,15 @@ mod tests {
             multifile: true,
         };
 
+        // 模拟真实批量：安装逐帧进度回调，使 write_one_dicom 的取消检查生效
+        set_batch_progress_cb(Some(Arc::new(|_, _: usize| {})));
         let handle = std::thread::spawn(move || export_dicom_impl(args));
         // 另一线程（主线程）在转换进行中并发置位取消标志
         batch_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
 
         let res = handle.join().expect("export_dicom 线程 panic");
         batch_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+        set_batch_progress_cb(None);
         let written = std::fs::read_dir(&out_dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
@@ -3766,8 +3777,12 @@ fn write_one_dicom(
     force_layered: bool,
     path: &str,
 ) -> Result<(), String> {
-    // 若用户在批量转换中途取消，立即中止（避免对当前文件继续编码/写入）
-    if batch_cancel_requested() {
+    // 仅当处于批量转换中（已安装逐帧进度回调）才响应取消标志；单次导出不应被残留的
+    // 取消标志中断。避免并行测试/历史残留标志误伤单次导出（见 repro_batch_htj2k 测试）。
+    let batch_active = BATCH_PROGRESS_CB
+        .get()
+        .map_or(false, |m| m.lock().unwrap().is_some());
+    if batch_active && batch_cancel_requested() {
         return Err("已取消（用户中止）".into());
     }
     // 传输语法
@@ -4402,11 +4417,23 @@ fn set_batch_progress_cb(cb: Option<BatchProgressCb>) {
     *m.lock().unwrap() = cb;
 }
 
+/// 测试专用：串行化所有会改动全局批量状态（BATCH_CANCEL / BATCH_PROGRESS_CB）的测试，
+/// 避免 `cargo test --lib` 并行运行时的相互竞态——例如取消测试在加载 100+ 文件期间长时间
+/// 持有 BATCH_CANCEL=true，会误伤同期的 HTJ2K 批量回读测试。仅在测试构建下存在。
+#[cfg(test)]
+static TEST_BATCH_LOCK: Mutex<()> = Mutex::new(());
+
 /// 由 export_dicom 逐帧调用；若当前批量任务已设置进度回调，则推送一帧进度。
+/// 内置限流：约每 2%（至多每 50 帧一步）推送一次，避免逐帧海量事件淹没前端渲染导致
+/// 进度条「看似不动」；首帧(cur==1)与收尾帧(cur>=total)始终推送，保证从 0% 平滑到 100%。
 fn report_frame_progress(cur: usize, total: usize) {
-    if let Some(m) = BATCH_PROGRESS_CB.get() {
-        if let Some(cb) = m.lock().unwrap().as_ref() {
-            cb(cur, total);
+    let step = ((total / 50).max(1)).min(50);
+    let due = cur == 1 || cur >= total || cur % step == 0;
+    if due {
+        if let Some(m) = BATCH_PROGRESS_CB.get() {
+            if let Some(cb) = m.lock().unwrap().as_ref() {
+                cb(cur, total);
+            }
         }
     }
 }
@@ -5861,6 +5888,137 @@ mod export_dicom_tests {
             TransferSyntaxRegistry.get("1.2.840.10008.1.2.4.200").is_some(),
             "旧自定义 .200 也应已注册，以便回读旧版导出的文件"
         );
+    }
+
+    #[test]
+    fn repro_batch_htj2k_lossless_transfer_syntax() {
+        let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
+        // 复现用户报告：批量 DICOM→DICOM、HTJ2K 无损、加密脱敏后，导出文件打开报「传输语法错误」。
+        // 用本应用自己的解码路径（decode_dicom_file → open_file + decode_dicom_htj2k）回读导出文件，
+        // 若文件结构/传输语法声明有误，open_file 或解码会直接报错，从而暴露根因。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("无法读取 data/CBCT")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "data/CBCT 下未找到 .dcm 文件");
+        // 取前 5 个以加快测试
+        let sources: Vec<String> = files.iter().take(5).cloned().collect();
+
+        let out_dir = std::env::temp_dir().join("unixel_htj2k_repro");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let build_args = || ExportDicomArgs {
+            mode: "all".into(),
+            file_path: sources[0].clone(),
+            series_paths: sources.clone(),
+            frame_index: 0,
+            transfer_syntax: "htj2k_lossless".into(),
+            quality: 0,
+            wc: 0.0,
+            ww: 0.0,
+            anon_ranges: vec![AnonRangeArg {
+                id: "patient".into(),
+                method: "encrypt".into(),
+            }],
+            password: "test".into(),
+            restore_password: String::new(),
+            force_layered: false,
+            output: out_dir.to_string_lossy().to_string(),
+            multifile: true,
+        };
+        // 重试：并行测试可能短时置位全局取消标志（cancel 测试），导致一次性导出被误中止。
+        // 本测试不走批量路径，故不触碰全局取消状态，仅等待并行 cancel 测试复位后重试即可
+        // （取消标志仅对真正批量有效；直接导出不应被残留标志中断）。
+        let mut exported: Option<String> = None;
+        for _ in 0..8 {
+            match export_dicom_impl(build_args()) {
+                Ok(s) => {
+                    exported = Some(s);
+                    break;
+                }
+                Err(e) if e.contains("已取消") => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("HTJ2K 批量导出应成功: {}", e),
+            }
+        }
+        let exported =
+            exported.expect("HTJ2K 批量导出应成功（重试后仍失败，可能被并行取消测试干扰）");
+        println!("[repro] 导出结果: {}", exported);
+
+        // 回读每个导出文件
+        let entries = std::fs::read_dir(&out_dir).expect("读取导出目录");
+        let mut dcm_outs: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        dcm_outs.sort();
+        println!("[repro] 导出文件数: {}", dcm_outs.len());
+        assert!(!dcm_outs.is_empty(), "未生成任何导出文件");
+
+        let mut open_errors = 0usize;
+        let mut decode_errors = 0usize;
+        let mut ts_mismatch = 0usize;
+        for p in &dcm_outs {
+            // 1) open_file：模拟外部查看器打开（传输语法声明错误会在此报「传输语法错误」）
+            match dicom_object::open_file(p) {
+                Ok(obj) => {
+                    let ts = obj.meta().transfer_syntax.to_string();
+                    // 磁盘上的 UID 按 DICOM 标准补齐到偶数字节（末尾空格/NUL），这是合法的；
+                    // 关键是应用在读回时必须 trim 后才能正确路由（已修复）。
+                    let ts_trim = ts.trim_end_matches([' ', '\0']);
+                    if ts_trim != TS_HTJ2K_LOSSLESS {
+                        println!("[repro][TS错误] {} 传输语法={} (应为 {})", p, ts, TS_HTJ2K_LOSSLESS);
+                        ts_mismatch += 1;
+                    }
+                    // 2) PixelData 应为封装且首片段非空
+                    match obj.element_by_name("PixelData") {
+                        Ok(pd) => match pd.value() {
+                            Value::PixelSequence(seq) => {
+                                let frags = seq.fragments();
+                                if frags.is_empty() || frags[0].is_empty() {
+                                    println!("[repro][空片段] {} PixelData 片段为空", p);
+                                    decode_errors += 1;
+                                }
+                            }
+                            _ => {
+                                println!("[repro][非封装] {} PixelData 不是封装格式", p);
+                                decode_errors += 1;
+                            }
+                        },
+                        Err(e) => {
+                            println!("[repro][无PixelData] {} {}", p, e);
+                            decode_errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("[repro][打开失败] {} {}", p, e);
+                    open_errors += 1;
+                }
+            }
+            // 3) 经本应用解码路径：应成功解码 HTJ2K
+            if let Err(e) = decode_dicom_file(p) {
+                println!("[repro][解码失败] {} {}", p, e);
+                decode_errors += 1;
+            }
+        }
+        println!(
+            "[repro] 汇总: 打开失败={}, 传输语法不符={}, 解码/结构失败={}",
+            open_errors, ts_mismatch, decode_errors
+        );
+        assert_eq!(open_errors, 0, "存在无法打开（传输语法错误）的导出文件");
+        assert_eq!(ts_mismatch, 0, "存在传输语法声明不符的导出文件");
+        assert_eq!(decode_errors, 0, "存在解码或结构错误的导出文件");
     }
 
     #[test]
