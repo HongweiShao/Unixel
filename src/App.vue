@@ -156,36 +156,57 @@ const batchAnonMap = reactive<Record<string, string>>(
 const batchAnonPassword = ref<string>("unixel");
 // 方案A「还原重脱敏」：批量导出 DICOM 时，填入原脱敏密码可还原本工具加密脱敏值后再重脱敏。
 const batchAnonRestorePassword = ref<string>("");
-// 脱敏范围说明气泡：Teleport 到 body 渲染，避免被 .batch-body 滚动容器裁剪。
-// 结构与文件信息对话框的 .qtip 保持一致（粗体标题 + .qtip-desc 逐行明细）。
-const anonTip = reactive<{
+// —— 悬浮说明气泡（批量脱敏 / 文件信息标签共用一套实现）——
+// .batch-body 与 .details-body 都有 overflow:auto，会裁剪 position:absolute 的气泡，
+// 故统一 Teleport 到 body 用 position:fixed，坐标由触发元素的 getBoundingClientRect() 计算。
+// 结构与视觉统一：粗体标题 + 逐行 .qtip-desc 明细（与 .qmark 圆形问号配套）。
+type TipState = {
   show: boolean;
   x: number;
   y: number;
+  flip: boolean; // 下方空间不足时向上翻转
   title: string;
   lines: string[];
-}>({
-  show: false,
-  x: 0,
-  y: 0,
-  title: "",
-  lines: [],
-});
-function showAnonTip(e: MouseEvent | FocusEvent, title: string, text: string) {
-  const el = e.currentTarget as HTMLElement;
+};
+const TIP_WIDTH = 260;
+const TIP_HALF = TIP_WIDTH / 2 + 8; // 半宽 + 边框/余量，用于水平钳制
+
+function newTip(): TipState {
+  return { show: false, x: 0, y: 0, flip: false, title: "", lines: [] };
+}
+// 在触发元素下方（空间不足则翻到上方）定位气泡，并做水平钳制避免溢出视口
+function placeTip(tip: TipState, el: HTMLElement, title: string, text: string) {
   const r = el.getBoundingClientRect();
-  // 弹窗为固定 260px 宽、水平居中于图标，故左右各留 134px 安全边距，避免贴边溢出视口
-  const half = 134;
-  const minX = half + 8;
-  const maxX = Math.max(minX, window.innerWidth - half - 8);
-  anonTip.x = Math.min(Math.max(r.left + r.width / 2, minX), maxX);
-  anonTip.y = r.bottom + 6;
-  anonTip.title = title;
-  anonTip.lines = text.split("\n").filter((s) => s.trim().length > 0);
-  anonTip.show = true;
+  const minX = TIP_HALF;
+  const maxX = Math.max(minX, window.innerWidth - TIP_HALF);
+  tip.x = Math.min(Math.max(r.left + r.width / 2, minX), maxX);
+  tip.title = title;
+  tip.lines = text.split("\n").filter((s) => s.trim().length > 0);
+  // 估算高度（标题行 + 明细行 + 内边距），决定向下弹还是向上弹
+  const est = 16 + tip.lines.length * 17 + 18;
+  const below = r.bottom + 6;
+  tip.flip = below + est > window.innerHeight && r.top - 6 - est > 0;
+  tip.y = tip.flip ? r.top - 6 : below;
+  tip.show = true;
+}
+
+// 批量转换：脱敏范围说明气泡
+const anonTip = reactive<TipState>(newTip());
+function showAnonTip(e: MouseEvent | FocusEvent, title: string, text: string) {
+  placeTip(anonTip, e.currentTarget as HTMLElement, title, text);
 }
 function hideAnonTip() {
   anonTip.show = false;
+}
+// 文件信息对话框：标签行圆形问号的悬停说明。
+// 用单个共享节点而非每行渲染一个隐藏气泡 —— 行数可达数百，且行内气泡会被 .details-body
+// 的 overflow:auto 裁剪。
+const tagTip = reactive<TipState>(newTip());
+function showTagTip(e: MouseEvent | FocusEvent, title: string, text: string) {
+  placeTip(tagTip, e.currentTarget as HTMLElement, title, text);
+}
+function hideTagTip() {
+  tagTip.show = false;
 }
 const batchNiiType = ref<string>("int16");
 const batchNiiSform = ref(true);
@@ -1319,11 +1340,21 @@ onMounted(async () => {
     <Teleport to="body">
       <div
         v-if="anonTip.show"
-        class="anon-tip-pop"
+        class="tip-pop"
+        :class="{ flip: anonTip.flip }"
         :style="{ left: anonTip.x + 'px', top: anonTip.y + 'px' }"
       >
         <b>{{ anonTip.title }}</b>
         <span v-for="(line, i) in anonTip.lines" :key="i" class="qtip-desc">{{ line }}</span>
+      </div>
+      <div
+        v-if="tagTip.show"
+        class="tip-pop"
+        :class="{ flip: tagTip.flip }"
+        :style="{ left: tagTip.x + 'px', top: tagTip.y + 'px' }"
+      >
+        <b>{{ tagTip.title }}</b>
+        <span v-for="(line, i) in tagTip.lines" :key="i" class="qtip-desc">{{ line }}</span>
       </div>
     </Teleport>
 
@@ -1368,7 +1399,8 @@ onMounted(async () => {
             {{ anonDecryptMsg }}
           </p>
         </div>
-        <div class="details-body">
+        <!-- 气泡是 fixed 定位，滚动时不会跟随，故滚动即收起，避免与触发图标错位 -->
+        <div class="details-body" @scroll="hideTagTip">
           <div
             v-if="exportTagsMsg"
             class="export-tags-msg"
@@ -1394,13 +1426,18 @@ onMounted(async () => {
                 <td>{{ r.vr }}</td>
                 <td>
                   {{ r.keyword }}
-                  <span v-if="r.description" class="qmark"
-                    >?
-                    <span class="qtip">
-                      <b>{{ r.keyword }}</b>
-                      <span class="qtip-desc">{{ r.description }}</span>
-                    </span>
-                  </span>
+                  <span
+                    v-if="r.description"
+                    class="qmark"
+                    tabindex="0"
+                    role="img"
+                    :aria-label="r.keyword + ' 标签说明'"
+                    @mouseenter="showTagTip($event, r.keyword, r.description)"
+                    @mouseleave="hideTagTip"
+                    @focus="showTagTip($event, r.keyword, r.description)"
+                    @blur="hideTagTip"
+                    >?</span
+                  >
                 </td>
                 <td
                   class="val"
@@ -1811,12 +1848,12 @@ main {
   vertical-align: middle;
   flex: 0 0 auto;
 }
-.qtip {
-  display: none;
-  position: absolute;
-  left: 18px;
-  top: 50%;
-  transform: translateY(-50%);
+/* 悬停说明气泡：两个滚动容器（.batch-body / .details-body）都有 overflow:auto，
+   绝对定位的气泡会被裁剪，故统一 Teleport 到 body + position:fixed。
+   视觉与结构由批量脱敏气泡、文件信息标签气泡共用。 */
+.tip-pop {
+  position: fixed;
+  transform: translateX(-50%);
   width: 260px;
   padding: 8px 10px;
   background: #1c1c22;
@@ -1825,12 +1862,15 @@ main {
   border-radius: 8px;
   font-size: 11px;
   line-height: 1.5;
-  z-index: 80;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   white-space: normal;
+  text-align: left;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 9999;
+  pointer-events: none;
 }
-.qmark:hover .qtip {
-  display: block;
+/* 下方空间不足时向上翻转（配合 placeTip 的 flip 判定） */
+.tip-pop.flip {
+  transform: translate(-50%, -100%);
 }
 .qtip-desc {
   display: block;
@@ -2282,32 +2322,14 @@ main {
   color: var(--fg-dim);
   line-height: 1.5;
 }
-/* 脱敏范围说明：复用 .qmark 圆形问号，仅重置外边距（父级 .batch-anon-item 已用 gap 控制间距） */
+/* 脱敏范围说明：复用 .qmark 圆形问号，仅重置外边距（父级 .batch-anon-item 已用 gap 控制间距）；
+   气泡视觉见上方共享的 .tip-pop（Teleport 到 body，固定定位，不被滚动容器裁剪） */
 .anon-help {
   margin-left: 0;
 }
 .anon-help:hover,
 .anon-help:focus {
   outline: none;
-}
-/* 悬停弹出的标签明细：视觉与 .qtip 一致；Teleport 到 body 用固定定位，不被滚动容器裁剪 */
-.anon-tip-pop {
-  position: fixed;
-  transform: translateX(-50%);
-  width: 260px;
-  max-width: 300px;
-  padding: 8px 10px;
-  background: #1c1c22;
-  color: #f0f0f3;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 11px;
-  line-height: 1.5;
-  white-space: normal;
-  text-align: left;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-  z-index: 9999;
-  pointer-events: none;
 }
 .batch-warn {
   color: #e0a000;
