@@ -3573,6 +3573,10 @@ fn write_one_dicom(
     force_layered: bool,
     path: &str,
 ) -> Result<(), String> {
+    // 若用户在批量转换中途取消，立即中止（避免对当前文件继续编码/写入）
+    if batch_cancel_requested() {
+        return Err("已取消（用户中止）".into());
+    }
     // 传输语法
     obj.meta_mut().transfer_syntax = ts_uid.to_string();
     obj.meta_mut().update_information_group_length();
@@ -3729,9 +3733,14 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
     } else if args.multifile {
         // 每帧单文件
         std::fs::create_dir_all(&args.output).map_err(|e| format!("创建目录失败: {}", e))?;
+        let frame_total: usize = sources.iter().map(|s| s.1.len()).sum();
         let mut fi = 0usize;
         for (obj, frames, info) in &sources {
             for f in frames {
+                // 逐帧检查取消：用户可在任意帧之间中止（解决「取消无效」问题）
+                if batch_cancel_requested() {
+                    return Err("已取消（用户中止）".into());
+                }
                 let mut o = obj.clone();
                 let single = vec![f.clone()];
                 let path = Path::new(&args.output).join(format!("frame_{:03}.dcm", fi + 1));
@@ -3758,6 +3767,8 @@ fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
             )?;
             written += 1;
             fi += 1;
+            // 逐帧推送进度（解决「进度条无显示」问题）
+            report_frame_progress(fi, frame_total);
             }
         }
     } else {
@@ -4179,6 +4190,39 @@ fn export_nifti(args: ExportNiftiArgs) -> Result<String, String> {
 static BATCH_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 fn batch_cancel_flag() -> &'static Arc<AtomicBool> {
     BATCH_CANCEL.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+/// 批量转换进度回调：由 batch_convert 在每个单元开始时设置，export_dicom 内部逐帧调用推送进度。
+type BatchProgressCb = Arc<dyn Fn(usize, usize) + Send + Sync>;
+static BATCH_PROGRESS_CB: OnceLock<std::sync::Mutex<Option<BatchProgressCb>>> = OnceLock::new();
+
+fn set_batch_progress_cb(cb: Option<BatchProgressCb>) {
+    let m = BATCH_PROGRESS_CB.get_or_init(|| std::sync::Mutex::new(None));
+    *m.lock().unwrap() = cb;
+}
+
+/// 由 export_dicom 逐帧调用；若当前批量任务已设置进度回调，则推送一帧进度。
+fn report_frame_progress(cur: usize, total: usize) {
+    if let Some(m) = BATCH_PROGRESS_CB.get() {
+        if let Some(cb) = m.lock().unwrap().as_ref() {
+            cb(cur, total);
+        }
+    }
+}
+
+/// 当前批量任务是否已被用户取消（在逐帧热循环中检查以中断转换）。
+fn batch_cancel_requested() -> bool {
+    batch_cancel_flag().load(Ordering::SeqCst)
+}
+
+/// 批量转换生命周期守卫：无论成功/失败/取消，离开作用域即清除进度回调并复位取消标志，
+/// 避免取消标志残留导致后续单次导出被误判为已取消。
+struct BatchProgressGuard;
+impl Drop for BatchProgressGuard {
+    fn drop(&mut self) {
+        set_batch_progress_cb(None);
+        batch_cancel_flag().store(false, Ordering::SeqCst);
+    }
 }
 
 const SC_IMAGE_STORAGE: &str = "1.2.840.10008.5.1.4.1.1.7"; // Secondary Capture Image Storage
@@ -4672,6 +4716,8 @@ async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<
 
     let flag = batch_cancel_flag();
     flag.store(false, Ordering::SeqCst);
+    // 生命周期守卫：函数返回（成功/失败/取消）时清除进度回调并复位取消标志
+    let _guard = BatchProgressGuard;
     let total = units.len();
     let mut items: Vec<BatchItem> = Vec::with_capacity(total);
     let inp = args.input_type.clone();
@@ -4685,6 +4731,28 @@ async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<
             break;
         }
         let src = unit.paths[0].clone();
+        // 为本单元设置逐帧进度回调（export_dicom 内部每处理一帧推送一次）
+        {
+            let pa = app.clone();
+            let pl = unit.label.clone();
+            let pi = idx + 1;
+            let pt = total;
+            let cb: BatchProgressCb = Arc::new(move |cur: usize, tot: usize| {
+                let _ = pa.emit(
+                    "batch-progress",
+                    BatchProgress {
+                        k: cur,
+                        n: tot,
+                        label: format!("{}（序列 {}/{}）", pl, pi, pt),
+                        src: String::new(),
+                        out: String::new(),
+                        ok: false,
+                        error: None,
+                    },
+                );
+            });
+            set_batch_progress_cb(Some(cb));
+        }
         let res: Result<String, String> = match (
             inp.eq_ignore_ascii_case("DICOM"),
             outp.eq_ignore_ascii_case("DICOM"),
@@ -4740,7 +4808,21 @@ async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<
         };
         let (ok_unit, out, error) = match res {
             Ok(out) => (true, out, None),
-            Err(e) => (false, String::new(), Some(e)),
+            Err(e) => {
+                if batch_cancel_requested() {
+                    // 用户在单元处理中途取消：记录当前单元并中断剩余单元
+                    cancelled = true;
+                    items.push(BatchItem {
+                        src: src.clone(),
+                        out: String::new(),
+                        ok: false,
+                        error: Some("已取消（用户中止）".into()),
+                    });
+                    break;
+                } else {
+                    (false, String::new(), Some(e))
+                }
+            }
         };
         let item = BatchItem {
             src: src.clone(),

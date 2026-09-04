@@ -228,6 +228,7 @@ async function startBatch() {
       (typeof e === "string" ? e : (e as { message?: string })?.message ?? String(e));
   } finally {
     batchRunning.value = false;
+    batchCancelling.value = false;
   }
 }
 async function cancelBatch() {
@@ -915,10 +916,14 @@ onMounted(async () => {
   // 监听后端批量转换进度事件（命令运行期间实时推送）
   try {
     await listen<BatchProgress>("batch-progress", (e) => {
-      batchLog.value.push(e.payload);
+      // 实时更新进度条（逐帧）
       batchProgress.value = { k: e.payload.k, n: e.payload.n, label: e.payload.label };
-      if (batchLog.value.length > 400) {
-        batchLog.value.splice(0, batchLog.value.length - 400);
+      // 仅在完成/失败（ok 或 error 有意义）时写日志，避免逐帧刷屏
+      if (e.payload.ok || e.payload.error) {
+        batchLog.value.push(e.payload);
+        if (batchLog.value.length > 400) {
+          batchLog.value.splice(0, batchLog.value.length - 400);
+        }
       }
     });
   } catch {
