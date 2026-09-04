@@ -2354,7 +2354,7 @@ mod tests {
             multifile: true,
         };
 
-        let handle = std::thread::spawn(move || export_dicom(args));
+        let handle = std::thread::spawn(move || export_dicom_impl(args));
         // 另一线程（主线程）在转换进行中并发置位取消标志
         batch_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3771,8 +3771,8 @@ fn write_one_dicom(
 
 // ---- 命令入口 ----
 
-#[tauri::command]
-fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
+// 同步实现：由 async 命令 export_dicom 经 spawn_blocking 调用，避免冻结 UI（与 batch_convert 同一模式）
+fn export_dicom_impl(args: ExportDicomArgs) -> Result<String, String> {
     let ts_arg = args.transfer_syntax.as_str();
     let ts_uid = match ts_arg {
         "implicit" => TS_IMPLICIT,
@@ -4210,7 +4210,15 @@ pub(crate) fn export_nifti_core(
 }
 
 #[tauri::command]
-fn export_nifti(args: ExportNiftiArgs) -> Result<String, String> {
+async fn export_dicom(args: ExportDicomArgs) -> Result<String, String> {
+    // 非阻塞：重活放到后台线程，避免冻结 UI（与 batch_convert 同一模式）
+    tauri::async_runtime::spawn_blocking(move || export_dicom_impl(args))
+        .await
+        .map_err(|e| format!("导出任务线程异常: {}", e))?
+}
+
+// 同步实现：由 async 命令 export_nifti 经 spawn_blocking 调用，避免冻结 UI（与 batch_convert 同一模式）
+fn export_nifti_impl(args: ExportNiftiArgs) -> Result<String, String> {
     // 1. 收集多帧 HU（已按 inferior->superior 重排）
     let (all_frames, obj, w, h) = load_source_frames(&args.file_path)?;
     let frames: Vec<Vec<f32>> = if args.mode == "all" {
@@ -4701,6 +4709,14 @@ fn build_dicom_series(
     Ok(written)
 }
 
+#[tauri::command]
+async fn export_nifti(args: ExportNiftiArgs) -> Result<String, String> {
+    // 非阻塞：重活放到后台线程，避免冻结 UI（与 batch_convert 同一模式）
+    tauri::async_runtime::spawn_blocking(move || export_nifti_impl(args))
+        .await
+        .map_err(|e| format!("导出任务线程异常: {}", e))?
+}
+
 fn nifti_to_dicom_series(src: &str, out_dir: &Path, opts: &BatchOptions) -> Result<String, String> {
     let vol = decode_nifti(src)?;
     let [nx, ny, nz] = vol.meta.dims;
@@ -4900,7 +4916,7 @@ fn run_batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<Ba
                 std::fs::create_dir_all(&unit.parent_dir)
                     .map_err(|e| format!("创建输出目录失败: {}", e))?;
                 let out = out_file.to_string_lossy().to_string();
-                export_nifti(ExportNiftiArgs {
+                export_nifti_impl(ExportNiftiArgs {
                     mode: "all".into(),
                     file_path: src.clone(),
                     series_paths: unit.paths.clone(),
@@ -4915,7 +4931,7 @@ fn run_batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<Ba
             (true, true) => {
                 // DICOM → DICOM（multifile，逐片保留几何）
                 let out_dir = unit.parent_dir.join(&unit.name);
-                export_dicom(ExportDicomArgs {
+                export_dicom_impl(ExportDicomArgs {
                     mode: "all".into(),
                     file_path: src.clone(),
                     series_paths: unit.paths.clone(),
