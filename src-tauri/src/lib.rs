@@ -2313,6 +2313,81 @@ mod tests {
         );
     }
 
+    /// v1.33 回归：取消标志可由「另一线程」在转换中途置位，且 export_dicom 的逐帧循环能观察到并中止。
+    /// 直接驱动真正干活的 export_dicom（multifile 路径，不依赖 AppHandle），从主线程并发置位 BATCH_CANCEL，
+    /// 断言其提前中断（已处理帧数 < 总数）并返回「已取消」错误。这守护 v1.33 修复链中的「逐帧取消检查」。
+    #[test]
+    fn export_dicom_multifile_cancel_from_other_thread() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("无法读取 data/CBCT 目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "data/CBCT 下未找到 .dcm 文件");
+        let total = files.len();
+
+        // 从干净状态开始，结束后再复位，避免污染并行测试
+        batch_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let out_dir = dir.join("..").join("CBCT_cancel_test");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let args = ExportDicomArgs {
+            mode: "all".into(),
+            file_path: files[0].clone(),
+            series_paths: files.clone(),
+            frame_index: 0,
+            transfer_syntax: "explicit".into(),
+            quality: 0,
+            wc: 0.0,
+            ww: 0.0,
+            anon_ranges: vec![],
+            password: String::new(),
+            restore_password: String::new(),
+            force_layered: false,
+            output: out_dir.to_string_lossy().to_string(),
+            multifile: true,
+        };
+
+        let handle = std::thread::spawn(move || export_dicom(args));
+        // 另一线程（主线程）在转换进行中并发置位取消标志
+        batch_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let res = handle.join().expect("export_dicom 线程 panic");
+        batch_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+        let written = std::fs::read_dir(&out_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |x| x.eq_ignore_ascii_case("dcm"))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let _ = std::fs::remove_dir_all(&out_dir);
+
+        assert!(res.is_err(), "取消后应返回错误（已中断转换）");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("取消"),
+            "错误信息应指示已取消，实际: {}",
+            msg
+        );
+        assert!(
+            written < total,
+            "取消后写出帧数({})应小于总数({})，确认提前中断",
+            written,
+            total
+        );
+    }
+
     #[test]
     fn htj2k_roundtrip_lossless() {
         let w = 48u32;
@@ -4683,6 +4758,17 @@ fn nifti_to_dicom_series(src: &str, out_dir: &Path, opts: &BatchOptions) -> Resu
 
 #[tauri::command]
 async fn batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<BatchResult, String> {
+    // 关键修复（v1.33）：重活放到独立的 blocking 线程，避免阻塞 Tauri 主线程/事件循环。
+    // 否则逐帧 emit 的 batch-progress 事件无法实时投递、且 batch_convert_cancel 调用会被排在
+    // 本次命令之后直到转换结束才处理——即「进度条不更新」与「取消无效」的根因。
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || run_batch_convert(app2, args))
+        .await
+        .map_err(|e| format!("批量转换任务线程异常: {}", e))?
+}
+
+/// 批量转换实际逻辑（在 spawn_blocking 后台线程执行，主线程保持空闲以实时投递事件并处理取消）。
+fn run_batch_convert(app: tauri::AppHandle, args: BatchConvertArgs) -> Result<BatchResult, String> {
     let input_dir = Path::new(&args.input_dir);
     let output_dir = Path::new(&args.output_dir);
     if !input_dir.is_dir() {
