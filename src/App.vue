@@ -51,6 +51,11 @@ function closeMenu() {
 
 // 关于对话框
 const aboutOpen = ref(false);
+const helpOpen = ref(false);
+function openHelp() {
+  helpOpen.value = true;
+  openMenu.value = null;
+}
 const appVersion = ref("0.1.0");
 function openAbout() {
   aboutOpen.value = true;
@@ -1040,6 +1045,7 @@ onMounted(async () => {
         <div class="menu" :class="{ open: openMenu === 'help' }" @click="toggleMenu('help')">
           帮助 <span class="caret">▾</span>
           <div v-if="openMenu === 'help'" class="dropdown" @click.stop>
+            <button @click="openHelp">使用文档</button>
             <button @click="openAbout">关于</button>
           </div>
         </div>
