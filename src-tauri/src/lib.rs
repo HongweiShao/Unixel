@@ -3067,7 +3067,10 @@ mod tests {
 // - 脱敏粒度：每范围独立选 处理方式（keep/delete/hash/encrypt/regenerate）。
 //   加密：PBKDF2-HMAC-SHA256(密码,盐)→AES-256-GCM；盐与算法标识写入私有标签，
 //   密码不入库（留空则默认 "unixel"）；密文映射以 JSON 存于私有标签。
-// - 标识：仅 SoftwareVersions (0018,1020) = "Unixel - Hongwei Shao"（后台自动写入，前端无对应 UI）。
+// - 标识：软件签名写入文件元信息 (0002,0013) ImplementationVersionName = "Unixel - Hongwei Shao"
+//   （后台自动写入，前端无对应 UI）。原先写在数据集的 (0018,1020) SoftwareVersions，但该标签
+//   语义是「采集设备的软件版本」，属设备模块；元信息组才表示「由哪个软件生成本文件」，更贴切。
+//   且 0002 组不参与脱敏，不会被误改。
 // - 整个序列：「输出形式」可选 单个文件（多帧，合并） / 多个文件（单帧）。
 // - HTJ2K 有损程度：openjph-core 0.1.0 无公开 rate/quality API，故映射到 DWT 分解层数(1..6)。
 
@@ -3086,6 +3089,9 @@ const TS_JPEGLS_LOSSLESS: &str = "1.2.840.10008.1.2.4.80";
 const TS_JPEGLS_LOSS: &str = "1.2.840.10008.1.2.4.81";
 // Multiframe Secondary Capture（合并多帧单文件时的 SOP 类，通用安全）
 const MF_SC_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7.4";
+// 工具签名：导出时写入文件元信息 (0002,0013) ImplementationVersionName 表明本文件由 Unixel 生成。
+// 注：VR=SH 的标准上限为 16 字符，本串为 21 字符（dicom-rs 不强制校验，常见阅片软件亦能正常读取）。
+const UNIXEL_SIGNATURE: &str = "Unixel - Hongwei Shao";
 
 // 脱敏范围分组：严格按「脱敏标签.txt」指定的 DICOM Tag 定义（id 与前端 anonGroups 对齐）。
 // 元组为 (group_number, element_number, 显示用 keyword)；keyword 仅用于解密面板展示，不影响脱敏目标 Tag。
@@ -3128,7 +3134,8 @@ const ANON_GROUPS: &[AnonGroup] = &[
         ],
     },
     // 设备信息类：General Equipment Module 标识（DICOM PS3.15 设备相关）。
-    // 不含 (0018,1020) SoftwareVersions：后台固定覆写为 "Unixel - Hongwei Shao"（工具签名），不纳入脱敏范围。
+    // 不含 (0018,1020) SoftwareVersions：它记录采集设备的软件版本，属源设备临床信息，
+    // 不应被当作生成方标识覆写（工具签名已改写到元信息 (0002,0013)），故不纳入脱敏范围。
     AnonGroup {
         id: "device",
         tags: &[
@@ -4199,8 +4206,14 @@ fn write_one_dicom(
         obj.meta_mut().media_storage_sop_class_uid = MF_SC_SOP_CLASS.to_string();
     }
 
-    // 软件标识
-    set_tag(obj, Tag(0x0018, 0x1020), VR::LO, "Unixel - Hongwei Shao");
+    // 软件标识：写入文件元信息 (0002,0013) ImplementationVersionName（VR=SH）。
+    // 该标签位于文件头 0002 组，不属数据集，故不会被脱敏/像素处理影响，也更贴合「由哪个软件
+    // 生成本文件」的语义（原先写在数据集的 (0018,1020) SoftwareVersions，而那是采集设备软件版本，
+    // 语义上属于设备，放在元信息里更准确）。
+    obj.meta_mut().implementation_version_name = Some(UNIXEL_SIGNATURE.to_string());
+    // 组长度必须在所有元信息字段改完后统一重算（下方 is_merged 会改 SOPClassUID，
+    // transfer_syntax 也在开头改过），否则 (0002,0000) 会与实际长度不符。
+    obj.meta_mut().update_information_group_length();
 
     // 方案A：若提供原密码且文件含本工具加密标记，先还原原始值，再按本轮策略重新脱敏
     // （避免对已加密占位符二次加密、对已删/哈希值重复处理）。
@@ -5984,7 +5997,7 @@ mod anon_decrypt_tests {
         // (0018,1000)DeviceSerialNumber（不含 StationName，其归属机构组）。
         // ① device=delete 时三项被移除并写强制标记，StationName 因属机构组而保留；
         // ② device=keep 时保留；③ StationName 现属 institution 组，institution=delete 时应移除；
-        // ④ 排除 (0018,1020)SoftwareVersions（后台固定写签名）。
+        // ④ 排除 (0018,1020)SoftwareVersions（属采集设备软件版本，非生成方标识，不纳入脱敏）。
         let build = || {
             FileDicomObject::new_empty_with_meta(
                 FileMetaTableBuilder::new()
@@ -6407,6 +6420,96 @@ mod export_dicom_tests {
         assert_eq!(open_errors, 0, "存在无法打开（传输语法错误）的导出文件");
         assert_eq!(ts_mismatch, 0, "存在传输语法声明不符的导出文件");
         assert_eq!(decode_errors, 0, "存在解码或结构错误的导出文件");
+    }
+
+    #[test]
+    fn export_writes_signature_to_meta_not_software_versions() {
+        let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
+        // 验证「Unixel - Hongwei Shao」写入文件元信息 (0002,0013) ImplementationVersionName，
+        // 而非数据集的 (0018,1020) SoftwareVersions。复用导出路径（同时覆盖导出与批量转换，
+        // 二者都经 export_dicom_impl → write_one_dicom）。
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("无法读取 data/CBCT")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "data/CBCT 下未找到 .dcm 文件");
+        let src = files[0].clone();
+
+        let out_dir = std::env::temp_dir().join("unixel_sig_repro");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mut exported: Option<String> = None;
+        for _ in 0..8 {
+            let args = ExportDicomArgs {
+                mode: "all".into(),
+                file_path: src.clone(),
+                series_paths: vec![src.clone()],
+                frame_index: 0,
+                transfer_syntax: "htj2k_lossless".into(),
+                quality: 0,
+                wc: 0.0,
+                ww: 0.0,
+                anon_ranges: vec![],
+                password: String::new(),
+                restore_password: String::new(),
+                force_layered: false,
+                output: out_dir.to_string_lossy().to_string(),
+                multifile: true,
+            };
+            match export_dicom_impl(args) {
+                Ok(s) => {
+                    exported = Some(s);
+                    break;
+                }
+                Err(e) if e.contains("已取消") => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("导出应成功: {}", e),
+            }
+        }
+        let exported = exported.expect("导出应成功（重试后仍失败，可能被并行取消测试干扰）");
+        println!("[sig] 导出结果: {}", exported);
+
+        // 仅取本导出生成的文件（out_dir 下唯一 .dcm）
+        let out_file = std::fs::read_dir(&out_dir)
+            .expect("读取导出目录")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("dcm")))
+            .expect("未生成导出文件");
+
+        let obj = dicom_object::open_file(&out_file).expect("打开导出文件失败");
+
+        // ① 元信息 (0002,0013) ImplementationVersionName 必须为签名
+        let ivn = obj.meta().implementation_version_name.as_deref().unwrap_or("");
+        assert_eq!(
+            ivn.trim_end_matches([' ', '\0']),
+            UNIXEL_SIGNATURE,
+            "(0002,0013) ImplementationVersionName 应为签名"
+        );
+
+        // ② 数据集 (0018,1020) SoftwareVersions 不得被写为签名
+        let sw = obj.element_by_name("SoftwareVersions").ok().map(|e| {
+            e.to_str()
+                .unwrap_or_default()
+                .trim_end_matches([' ', '\0'])
+                .to_string()
+        });
+        assert!(
+            sw.as_deref() != Some(UNIXEL_SIGNATURE),
+            "(0018,1020) SoftwareVersions 不应再写入 Unixel 签名（现应留给源设备软件版本）"
+        );
+        println!(
+            "[sig] ImplementationVersionName={:?}, SoftwareVersions={:?}",
+            ivn, sw
+        );
     }
 
     #[test]
