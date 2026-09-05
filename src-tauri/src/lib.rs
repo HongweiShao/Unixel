@@ -3067,7 +3067,7 @@ mod tests {
 // - 脱敏粒度：每范围独立选 处理方式（keep/delete/hash/encrypt/regenerate）。
 //   加密：PBKDF2-HMAC-SHA256(密码,盐)→AES-256-GCM；盐与算法标识写入私有标签，
 //   密码不入库（留空则默认 "unixel"）；密文映射以 JSON 存于私有标签。
-// - 标识：软件签名写入文件元信息 (0002,0013) ImplementationVersionName = "Unixel - Hongwei Shao"
+// - 标识：软件签名写入文件元信息 (0002,0013) ImplementationVersionName = "Unixel-H.Shao"
 //   （后台自动写入，前端无对应 UI）。原先写在数据集的 (0018,1020) SoftwareVersions，但该标签
 //   语义是「采集设备的软件版本」，属设备模块；元信息组才表示「由哪个软件生成本文件」，更贴切。
 //   且 0002 组不参与脱敏，不会被误改。
@@ -3090,8 +3090,8 @@ const TS_JPEGLS_LOSS: &str = "1.2.840.10008.1.2.4.81";
 // Multiframe Secondary Capture（合并多帧单文件时的 SOP 类，通用安全）
 const MF_SC_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7.4";
 // 工具签名：导出时写入文件元信息 (0002,0013) ImplementationVersionName 表明本文件由 Unixel 生成。
-// 注：VR=SH 的标准上限为 16 字符，本串为 21 字符（dicom-rs 不强制校验，常见阅片软件亦能正常读取）。
-const UNIXEL_SIGNATURE: &str = "Unixel - Hongwei Shao";
+// 注：VR=SH 的标准上限为 16 字符，本串为 13 字符（"Unixel-H.Shao"），已完全符合 SH 长度约束。
+const UNIXEL_SIGNATURE: &str = "Unixel-H.Shao";
 
 // 脱敏范围分组：严格按「脱敏标签.txt」指定的 DICOM Tag 定义（id 与前端 anonGroups 对齐）。
 // 元组为 (group_number, element_number, 显示用 keyword)；keyword 仅用于解密面板展示，不影响脱敏目标 Tag。
@@ -4561,7 +4561,7 @@ pub(crate) fn export_nifti_core(
     hdr.xyzt_units = 2; // mm
     hdr.cal_max = hu_max;
     hdr.cal_min = hu_min;
-    hdr.descrip = b"Unixel - Hongwei Shao".to_vec();
+    hdr.descrip = b"Unixel-H.Shao".to_vec();
     if write_sform {
         if let (Some(iopv), Some(p0)) = (iop, first_pos) {
             let n = nifti_normal(iopv);
@@ -6425,7 +6425,7 @@ mod export_dicom_tests {
     #[test]
     fn export_writes_signature_to_meta_not_software_versions() {
         let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
-        // 验证「Unixel - Hongwei Shao」写入文件元信息 (0002,0013) ImplementationVersionName，
+        // 验证「Unixel-H.Shao」写入文件元信息 (0002,0013) ImplementationVersionName，
         // 而非数据集的 (0018,1020) SoftwareVersions。复用导出路径（同时覆盖导出与批量转换，
         // 二者都经 export_dicom_impl → write_one_dicom）。
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
