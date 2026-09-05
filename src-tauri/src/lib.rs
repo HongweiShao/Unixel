@@ -3067,7 +3067,7 @@ mod tests {
 // - 脱敏粒度：每范围独立选 处理方式（keep/delete/hash/encrypt/regenerate）。
 //   加密：PBKDF2-HMAC-SHA256(密码,盐)→AES-256-GCM；盐与算法标识写入私有标签，
 //   密码不入库（留空则默认 "unixel"）；密文映射以 JSON 存于私有标签。
-// - 标识：软件签名写入文件元信息 (0002,0013) ImplementationVersionName = "Unixel-H.Shao"
+// - 标识：软件签名写入文件元信息 (0002,0013) ImplementationVersionName = "Unixel-{Version}"（{Version}=crate 版本号）
 //   （后台自动写入，前端无对应 UI）。原先写在数据集的 (0018,1020) SoftwareVersions，但该标签
 //   语义是「采集设备的软件版本」，属设备模块；元信息组才表示「由哪个软件生成本文件」，更贴切。
 //   且 0002 组不参与脱敏，不会被误改。
@@ -3090,8 +3090,9 @@ const TS_JPEGLS_LOSS: &str = "1.2.840.10008.1.2.4.81";
 // Multiframe Secondary Capture（合并多帧单文件时的 SOP 类，通用安全）
 const MF_SC_SOP_CLASS: &str = "1.2.840.10008.5.1.4.1.1.7.4";
 // 工具签名：导出时写入文件元信息 (0002,0013) ImplementationVersionName 表明本文件由 Unixel 生成。
-// 注：VR=SH 的标准上限为 16 字符，本串为 13 字符（"Unixel-H.Shao"），已完全符合 SH 长度约束。
-const UNIXEL_SIGNATURE: &str = "Unixel-H.Shao";
+// 格式为 "Unixel-{Version}"，{Version} 取编译期 crate 版本号（见 Cargo.toml）。
+// 注：VR=SH 的标准上限为 16 字符；当前 "Unixel-0.1.0" 为 11 字符，未来版本号（如 1.10.0）亦在约束内。
+const UNIXEL_SIGNATURE: &str = concat!("Unixel-", env!("CARGO_PKG_VERSION"));
 
 // 脱敏范围分组：严格按「脱敏标签.txt」指定的 DICOM Tag 定义（id 与前端 anonGroups 对齐）。
 // 元组为 (group_number, element_number, 显示用 keyword)；keyword 仅用于解密面板展示，不影响脱敏目标 Tag。
@@ -3334,6 +3335,86 @@ fn set_tag_str(obj: &mut FileDicomObject<InMemDicomObject>, tag: Tag, val: &str)
         let vr = el.vr();
         obj.put(InMemElement::new(tag, vr, PrimitiveValue::from(val.to_string())));
     }
+}
+
+/// 返回当前本地日期(DICOM DA: YYYYMMDD)与时间(DICOM TM: HHMMSS)。
+/// 通过 Windows API 获取本地时间；非 Windows 平台退化为 UTC。
+fn local_da_tm() -> (String, String) {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetLocalTime(lp_system_time: *mut SystemTime);
+        }
+        let mut st = SystemTime {
+            year: 0,
+            month: 0,
+            day_of_week: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            milliseconds: 0,
+        };
+        unsafe {
+            GetLocalTime(&mut st);
+        }
+        (
+            format!("{:04}{:02}{:02}", st.year, st.month, st.day),
+            format!("{:02}{:02}{:02}", st.hour, st.minute, st.second),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        utc_da_tm()
+    }
+}
+
+/// UTC 兜底（仅非 Windows 平台编译路径使用）。将 UNIX 纪元秒换算为 Gregorian 日期/时间。
+#[cfg(not(windows))]
+fn utc_da_tm() -> (String, String) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (y, m, d) = civil_from_days(days as i64);
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    (
+        format!("{:04}{:02}{:02}", y, m, d),
+        format!("{:02}{:02}{:02}", hh, mm, ss),
+    )
+}
+
+/// Howard Hinnant 的 days→Gregorian 算法，返回 (年, 月[1-12], 日[1-31])。
+#[cfg(not(windows))]
+fn civil_from_days(z0: i64) -> (i64, u32, u32) {
+    let z = z0 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0,399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0,365]
+    let mp = (5 * doy + 2) / 153; // [0,11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1,31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1,12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// 构造 (0012,0064) DeidentificationMethodCodeSequence 的单个代码项（自定义设计符 99UNIXEL）。
@@ -4206,11 +4287,23 @@ fn write_one_dicom(
         obj.meta_mut().media_storage_sop_class_uid = MF_SC_SOP_CLASS.to_string();
     }
 
-    // 软件标识：写入文件元信息 (0002,0013) ImplementationVersionName（VR=SH）。
-    // 该标签位于文件头 0002 组，不属数据集，故不会被脱敏/像素处理影响，也更贴合「由哪个软件
-    // 生成本文件」的语义（原先写在数据集的 (0018,1020) SoftwareVersions，而那是采集设备软件版本，
-    // 语义上属于设备，放在元信息里更准确）。
-    obj.meta_mut().implementation_version_name = Some(UNIXEL_SIGNATURE.to_string());
+    // 软件标识与工具元数据：写入文件元信息 (0002,0013) ImplementationVersionName（VR=SH），
+    // 同时在数据集写一块工具标识（General Equipment 相关标签），便于溯源：
+    //   (0018,1016) = "Hongwei Shao"（作者）
+    //   (0018,1018) = "Unixel"（工具名）
+    //   (0018,1019) = 与 (0002,0013) 一致的签名 "Unixel-{Version}"
+    //   (0018,1012) = 导出/转换日期（DA，YYYYMMDD，本地时间）
+    //   (0018,1014) = 导出/转换时间（TM，HHMMSS，本地时间）
+    // (0002,0013) 位于文件头 0002 组，不属数据集，故不会被脱敏/像素处理影响；
+    // 下方 (0018,10xx) 亦不属于任一脱敏分组，安全保留。
+    let unixel_signature = UNIXEL_SIGNATURE.to_string();
+    obj.meta_mut().implementation_version_name = Some(unixel_signature.clone());
+    set_tag(obj, Tag(0x0018, 0x1016), VR::LO, "Hongwei Shao");
+    set_tag(obj, Tag(0x0018, 0x1018), VR::LO, "Unixel");
+    set_tag(obj, Tag(0x0018, 0x1019), VR::LO, &unixel_signature);
+    let (export_date, export_time) = local_da_tm();
+    set_tag(obj, Tag(0x0018, 0x1012), VR::DA, &export_date);
+    set_tag(obj, Tag(0x0018, 0x1014), VR::TM, &export_time);
     // 组长度必须在所有元信息字段改完后统一重算（下方 is_merged 会改 SOPClassUID，
     // transfer_syntax 也在开头改过），否则 (0002,0000) 会与实际长度不符。
     obj.meta_mut().update_information_group_length();
@@ -4561,7 +4654,7 @@ pub(crate) fn export_nifti_core(
     hdr.xyzt_units = 2; // mm
     hdr.cal_max = hu_max;
     hdr.cal_min = hu_min;
-    hdr.descrip = b"Unixel-H.Shao".to_vec();
+    hdr.descrip = concat!("Unixel-", env!("CARGO_PKG_VERSION")).as_bytes().to_vec();
     if write_sform {
         if let (Some(iopv), Some(p0)) = (iop, first_pos) {
             let n = nifti_normal(iopv);
@@ -6425,9 +6518,14 @@ mod export_dicom_tests {
     #[test]
     fn export_writes_signature_to_meta_not_software_versions() {
         let _lk = crate::TEST_BATCH_LOCK.lock().unwrap();
-        // 验证「Unixel-H.Shao」写入文件元信息 (0002,0013) ImplementationVersionName，
-        // 而非数据集的 (0018,1020) SoftwareVersions。复用导出路径（同时覆盖导出与批量转换，
-        // 二者都经 export_dicom_impl → write_one_dicom）。
+        // 验证工具标识块写入：
+        //   (0002,0013) ImplementationVersionName = "Unixel-{Version}"（如 "Unixel-0.1.0"）
+        //   (0018,1016) = "Hongwei Shao"
+        //   (0018,1018) = "Unixel"
+        //   (0018,1019) = 与 (0002,0013) 一致
+        //   (0018,1012) = 导出日期(DA, 8位数字) / (0018,1014) = 导出时间(TM, 6位数字)
+        // 且 (0018,1020) SoftwareVersions 不被写入 Unixel 签名。
+        // 复用导出路径（同时覆盖导出与批量转换，二者都经 export_dicom_impl → write_one_dicom）。
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/CBCT");
         let mut files: Vec<String> = std::fs::read_dir(&dir)
             .expect("无法读取 data/CBCT")
@@ -6487,15 +6585,54 @@ mod export_dicom_tests {
 
         let obj = dicom_object::open_file(&out_file).expect("打开导出文件失败");
 
-        // ① 元信息 (0002,0013) ImplementationVersionName 必须为签名
+        // ① 元信息 (0002,0013) ImplementationVersionName 必须为 "Unixel-{Version}"
         let ivn = obj.meta().implementation_version_name.as_deref().unwrap_or("");
         assert_eq!(
             ivn.trim_end_matches([' ', '\0']),
             UNIXEL_SIGNATURE,
-            "(0002,0013) ImplementationVersionName 应为签名"
+            "(0002,0013) ImplementationVersionName 应为 Unixel-{{Version}} 签名"
         );
 
-        // ② 数据集 (0018,1020) SoftwareVersions 不得被写为签名
+        // ② 数据集工具标识块
+        let read_tag = |t: (u16, u16)| -> Option<String> {
+            obj.element(Tag(t.0, t.1)).ok().map(|e| {
+                e.to_str()
+                    .unwrap_or_default()
+                    .trim_end_matches([' ', '\0'])
+                    .to_string()
+            })
+        };
+        assert_eq!(
+            read_tag((0x0018, 0x1016)).as_deref(),
+            Some("Hongwei Shao"),
+            "(0018,1016) 应为 \"Hongwei Shao\""
+        );
+        assert_eq!(
+            read_tag((0x0018, 0x1018)).as_deref(),
+            Some("Unixel"),
+            "(0018,1018) 应为 \"Unixel\""
+        );
+        assert_eq!(
+            read_tag((0x0018, 0x1019)).as_deref(),
+            Some(UNIXEL_SIGNATURE),
+            "(0018,1019) 应与 (0002,0013) 一致"
+        );
+
+        // ③ 导出日期 (0018,1012, DA) 与导出时间 (0018,1014, TM) 格式校验
+        let da = read_tag((0x0018, 0x1012)).unwrap_or_default();
+        let tm = read_tag((0x0018, 0x1014)).unwrap_or_default();
+        assert!(
+            da.len() == 8 && da.chars().all(|c| c.is_ascii_digit()),
+            "(0018,1012) 应为 8 位 YYYYMMDD 日期，实际: {:?}",
+            da
+        );
+        assert!(
+            tm.len() == 6 && tm.chars().all(|c| c.is_ascii_digit()),
+            "(0018,1014) 应为 6 位 HHMMSS 时间，实际: {:?}",
+            tm
+        );
+
+        // ④ 数据集 (0018,1020) SoftwareVersions 不得被写入 Unixel 签名
         let sw = obj.element_by_name("SoftwareVersions").ok().map(|e| {
             e.to_str()
                 .unwrap_or_default()
@@ -6507,8 +6644,8 @@ mod export_dicom_tests {
             "(0018,1020) SoftwareVersions 不应再写入 Unixel 签名（现应留给源设备软件版本）"
         );
         println!(
-            "[sig] ImplementationVersionName={:?}, SoftwareVersions={:?}",
-            ivn, sw
+            "[sig] ImplementationVersionName={:?}, (0018,1016)={:?}, (0018,1018)={:?}, (0018,1019)={:?}, date={:?}, time={:?}, SoftwareVersions={:?}",
+            ivn, read_tag((0x0018,0x1016)), read_tag((0x0018,0x1018)), read_tag((0x0018,0x1019)), da, tm, sw
         );
     }
 

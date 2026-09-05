@@ -335,7 +335,7 @@ async function onExportJpeg() {
   }
 }
 
-// 导出 DICOM（保留原始像素 + 可选脱敏；后台自动写入 (0002,0013) ImplementationVersionName = "Unixel-H.Shao"）
+// 导出 DICOM（保留原始像素 + 可选脱敏；后台自动写入 (0002,0013) ImplementationVersionName = "Unixel-{Version}" 及数据集工具标识块）
 const exportDicomOpen = ref(false);
 const exportDicomScope = ref<"current" | "all">("current");
 const exportTs = ref<string>("explicit");
