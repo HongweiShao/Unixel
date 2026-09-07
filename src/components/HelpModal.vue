@@ -6,7 +6,15 @@ import manualRaw from "../assets/docs/usermanual.md?raw";
 const props = defineProps<{ visible: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
 
-const html = computed(() => marked.parse(manualRaw, { async: false }) as string);
+const html = computed(() => {
+  try {
+    return marked.parse(manualRaw, { async: false }) as string;
+  } catch (e) {
+    // 兜底：解析异常时直接以纯文本展示，避免整窗空白
+    console.error("[HelpModal] marked parse failed:", e);
+    return `<pre>${manualRaw.replace(/</g, "&lt;")}</pre>`;
+  }
+});
 
 function close() {
   emit("close");

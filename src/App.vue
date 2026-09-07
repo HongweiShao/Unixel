@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, reactive, onMounted, nextTick, watch } from "vue";
 import Viewer from "./components/Viewer.vue";
+import HelpModal from "./components/HelpModal.vue";
 import type {
   DicomMeta,
   DicomImage,
