@@ -1161,6 +1161,9 @@ onMounted(async () => {
       </div>
     </div>
 
+    <!-- 使用文档弹窗 -->
+    <HelpModal :visible="helpOpen" @close="helpOpen = false" />
+
     <!-- 序列选择对话框（文件夹导入含多个序列时弹出） -->
     <div v-if="seriesSelectOpen" class="modal-mask" @click.self="closeSeriesSelect">
       <div class="modal series-select">
