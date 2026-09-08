@@ -3,6 +3,7 @@ name = "unixel"
 version = "0.1.0"
 description = "医学影像查看与处理工具"
 authors = ["Unixel"]
+license = "LGPL-3.0-or-later"
 edition = "2021"
 
 [lib]

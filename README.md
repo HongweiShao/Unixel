@@ -171,6 +171,10 @@ Unixel 仅供**研究、教育与非临床**用途，**不构成为诊断设备*
 
 ## 📄 许可证（License）
 
-本项目源代码版权归作者 **Hongwei Shao（邵宏伟）** 所有。当前版本（v0.1.0）**尚未采用标准开源许可证**；如需用于商业或再分发，请与作者联系授权。
+本项目以 **GNU Lesser General Public License v3.0（LGPL-3.0）** 授权开源。
 
-作者：Hongwei Shao ｜ 联系：hongweishao@outlook.com
+- 完整许可证文本见仓库根目录 `LICENSE` 文件。
+- 在 LGPL-3.0 条款下，你可自由使用、修改、分发本软件，并可将其作为库链接到闭源或专有软件（须履行相应义务：对修改部分以 LGPL-3.0 开源、保留版权与许可证声明、提供源码获取方式等）。
+- 本软件按「现状」提供，免责与责任限制详见 `LICENSE`。
+
+作者：Hongwei Shao（邵宏伟）｜ 联系：hongweishao@outlook.com
